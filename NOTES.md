@@ -14,3 +14,24 @@ Observations: TPOT ≈ 37 ms regardless of batch → decode is purely overhead b
 (bandwidth floor is ~2.5 ms). Gates: our TTFT ≤ 1.10× native TTFT (~46 ms at b1×512, ~220 ms at b4×2048).
 
 Note: the dryft CLI needs `DRYFT_API=https://htn.dryft.ai` (default endpoint returns HTTP 403).
+
+## Setup status
+- No GPU: the Baseten H100 workstation (job wlvve1q) never left PENDING and was stopped; no jobs active.
+- `scripts/remote_setup.sh`, `localjudge/` (judge.py, bench.py, profile_step.py) and `scripts/hotpath_dryft_qwen.yaml`:
+  **optional, not used (no GPU)**. Kept for when a GPU is available.
+- Every Dryft run is the test: the engine self-checks during the untimed warmup and logs `[engine]` lines.
+- Pre-push: `scripts/cpu_sanity.py` (CPU venv with torch 2.5.1+cpu, transformers 4.51.3; tiny random Qwen3,
+  exercises T1/T0, self-check bookkeeping, yield contract) + py_compile + `dryft validate engine`.
+
+## Engine tiers (self-guard, chosen per workload during warmup)
+T3 graphs + fused Triton (qk-norm+RoPE+cache write, SiLU×up) · T2 graphs + Triton norm/decode-attn ·
+T1 eager torch-only (reference SDPA on cache) · T0 native starter loop.
+Each tier is validated on the warmup prompt (first 32 steps, teacher-forced through native HF);
+margin > 1.0, exception or non-finite → `FALLBACK T<n>→T<n-1>`.
+
+## Runs
+| # | commit | change | score | b1×512→32 | b4×2048→32 | b16×512→128 | TTFT/TPOT ratio (worst) | tier | margin | verdict |
+|---|---|---|---:|---:|---:|---:|---|---|---|---|
+| 0 | 3e18b72 | unchanged starter | 127.29 | 27.1 | 92.4 | 410.3 | 1.03/1.05 | native | – | baseline |
+
+Current best: 127.29 · target 1200 · gap 9.4×
