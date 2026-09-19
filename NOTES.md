@@ -35,3 +35,35 @@ margin > 1.0, exception or non-finite → `FALLBACK T<n>→T<n-1>`.
 | 0 | 3e18b72 | unchanged starter | 127.29 | 27.1 | 92.4 | 410.3 | 1.03/1.05 | native | – | baseline |
 
 Current best: 127.29 · target 1200 · gap 9.4×
+
+## Phase 4 design — exact prompt-lookup speculative decoding (T4 + spec)
+**Draft (host, per sequence).** Prompt-lookup n-grams over prompt + generated tokens. Two dicts per
+sequence (n=3, n=2) map an n-gram → index right after its most recent *earlier* occurrence (an n-gram
+is registered only once its continuation token exists, so the current suffix never matches itself).
+Draft = the k tokens following the match (n=3 first, then n=2); short/no match → pad with the last
+token (padding is simply rejected; the graph shape is fixed). Index build is O(S) dict inserts per
+sequence (~1 ms at S=2048), done after the first token is yielded, so TTFT is untouched.
+
+**Verify (device, one CUDA graph, fixed k).** Input per sequence: T = k+1 tokens
+`[last accepted token, d1..dk]` at absolute positions `pos_b .. pos_b+k` (per-sequence `pos` vector).
+Forward = the T4 decode path generalised to M = B·T rows: fused q/k-norm + RoPE + KV write at
+`pos_b + t`, a causal multi-query split-K GQA attention (row (t, head) sees keys `<= pos_b + t`;
+fully-masked splits are NaN-safe), skinny GEMMs tuned for M = B·T, LM head + argmax for all B·T rows.
+Output g[b, 0..k] = our greedy token after each prefix.
+
+**Accept (host).** a_b = longest prefix with d_i == g[b, i-1]; emit g[b, 0..a_b] (a_b+1 tokens).
+Every emitted token is the model's argmax on our own prefix → exact by construction (only reduction
+order differs from T=1 decode). KV at `pos_b .. pos_b+a_b` came from accepted inputs; rejected slots
+are overwritten by the next verify, and attention never reads past `pos_b + t`.
+
+**Batch.** Per-sequence acceptance; yield step t once *every* sequence has token t. Sequences that
+reach N tokens are frozen (same input, same pos) so capacity S+N+T is never exceeded.
+Throughput per verify ≈ min_b(a_b)+1 → useful mainly for small B; M = B·T must be ≤ 64.
+k = 6 for B = 1, 4 for B ≤ 12 (B·T ≤ 64), off otherwise.
+
+**Safety / auto-disable (warmup only).** After T4 is chosen: capture the verify graph, run the spec
+stream on the warmup prompt for min(N, 128) tokens, teacher-force them through native (margin ≤ 1.0),
+and time spec vs plain T4 on the same prompt. Keep spec only if it is exact and ≥ 8% faster.
+**Risks:** (1) the 25% spread gate — acceptance varies by prompt; total time includes prefill, which
+dilutes it; (2) one host sync per verify (no one-step-ahead pipelining) ~50–100 µs; (3) extra warmup
+compile for the M = B·T GEMM plans (budget 300 s).

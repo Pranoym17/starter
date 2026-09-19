@@ -27,6 +27,25 @@ def _bf(x):
 
 
 @triton.jit
+def _row_rstd(x_base, m_ok, K, eps, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
+    """Qwen3RMSNorm's rsqrt(mean(x*x) + eps) per row, fp32 (reduction order differs only)."""
+    rk = tl.arange(0, BLOCK_K)
+    ss = tl.zeros([BLOCK_M], tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        x = tl.load(x_base + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
+        ss += tl.sum(x * x, axis=1)
+    return tl.math.rsqrt(ss / K + eps)
+
+
+@triton.jit
+def _normed(x, rstd, nw_ptr, k):
+    """weight * bf16(x * rstd), rounded to BF16: exactly the reference's cast placement."""
+    xn = (x.to(tl.float32) * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(nw_ptr + k).to(tl.float32)
+    return (xn * w[None, :]).to(tl.bfloat16)
+
+
+@triton.jit
 def _epilogue(acc, acc2, res_ptrs, out_ptrs, mask, EPI: tl.constexpr):
     if EPI == 1:
         y = tl.load(res_ptrs, mask=mask, other=0.0).to(tl.float32) + _bf(acc)
@@ -39,10 +58,10 @@ def _epilogue(acc, acc2, res_ptrs, out_ptrs, mask, EPI: tl.constexpr):
 
 
 @triton.jit
-def _gemv_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr,
+def _gemv_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, nw_ptr, eps,
                  M, N, K, stride_x, stride_w, stride_out, stride_res, k_chunk, pair_off,
                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                 EPI: tl.constexpr, SPLIT: tl.constexpr):
+                 EPI: tl.constexpr, SPLIT: tl.constexpr, NORM: tl.constexpr):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     rm = tl.arange(0, BLOCK_M)
@@ -56,9 +75,13 @@ def _gemv_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr,
     acc2 = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
     x_base = x_ptr + rm[:, None] * stride_x
     w_base = w_ptr + rn[:, None] * stride_w
+    if NORM:
+        rstd = _row_rstd(x_base, m_ok, K, eps, BLOCK_M, BLOCK_K)
     for k0 in range(k_lo, k_hi, BLOCK_K):
         k = k0 + rk
         x = tl.load(x_base + k[None, :], mask=m_ok[:, None], other=0.0)
+        if NORM:
+            x = _normed(x, rstd, nw_ptr, k)
         w = tl.load(w_base + k[None, :], mask=n_ok[:, None], other=0.0)
         acc = tl.dot(x, tl.trans(w), acc)
         if EPI == 2:
@@ -93,8 +116,9 @@ def _splitk_reduce_kernel(part_ptr, out_ptr, res_ptr, M, N, n_split, stride_out,
 
 
 @triton.jit
-def _lm_argmax_partial_kernel(x_ptr, w_ptr, pval_ptr, pidx_ptr, M, N, K, stride_x, stride_w, n_tiles,
-                              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+def _lm_argmax_partial_kernel(x_ptr, w_ptr, pval_ptr, pidx_ptr, nw_ptr, eps, M, N, K, stride_x, stride_w,
+                              n_tiles, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                              NORM: tl.constexpr):
     pid = tl.program_id(0)
     rm = tl.arange(0, BLOCK_M)
     rn = pid * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -102,9 +126,14 @@ def _lm_argmax_partial_kernel(x_ptr, w_ptr, pval_ptr, pidx_ptr, M, N, K, stride_
     m_ok = rm < M
     n_ok = rn < N
     acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+    x_base = x_ptr + rm[:, None] * stride_x
+    if NORM:
+        rstd = _row_rstd(x_base, m_ok, K, eps, BLOCK_M, BLOCK_K)
     for k0 in range(0, K, BLOCK_K):
         k = k0 + rk
-        x = tl.load(x_ptr + rm[:, None] * stride_x + k[None, :], mask=m_ok[:, None], other=0.0)
+        x = tl.load(x_base + k[None, :], mask=m_ok[:, None], other=0.0)
+        if NORM:
+            x = _normed(x, rstd, nw_ptr, k)
         w = tl.load(w_ptr + rn[:, None] * stride_w + k[None, :], mask=n_ok[:, None], other=0.0)
         acc = tl.dot(x, tl.trans(w), acc)
     logits = tl.where(n_ok[None, :], _bf(acc), float("-inf"))   # the reference's logits are BF16
@@ -136,8 +165,10 @@ class Gemv:
         (32, 128, 4, 4), (64, 128, 4, 4), (16, 256, 4, 3), (32, 256, 8, 3),
     ]
 
-    def __init__(self, M, N, K, epi, device, sm_count, cfg=None):
+    def __init__(self, M, N, K, epi, device, sm_count, cfg=None, norm_eps=None):
+        """norm_eps: fuse Qwen3RMSNorm of x (its weight passed per call) into the prologue."""
         self.M, self.N, self.K, self.epi = M, N, K, epi
+        self.norm_eps = norm_eps
         self.device, self.sm = device, sm_count
         self.part = None
         self.set_config(cfg or self.CANDIDATES[0])
@@ -155,17 +186,19 @@ class Gemv:
         if self.split > 1:
             self.part = torch.empty((self.split, self.M, 2 * self.N), dtype=torch.float32, device=self.device)
 
-    def __call__(self, x, w, out, res=None):
+    def __call__(self, x, w, out, res=None, norm_w=None):
         assert self.K % self.cfg[1] == 0 and x.stride(-1) == 1 and w.stride(-1) == 1
+        assert (norm_w is not None) == (self.norm_eps is not None)
         bn, bk, warps, stages = self.cfg
         res_t = res if res is not None else out
         split = self.split > 1
         _gemv_kernel[(self.tiles, self.split)](
             x, w, out, res_t, self.part if split else out,
+            norm_w if norm_w is not None else w, self.norm_eps or 0.0,
             self.M, self.N, self.K, x.stride(0), w.stride(0), out.stride(0), res_t.stride(0),
             self.chunk, self.N,
             BLOCK_M=_block_m(self.M), BLOCK_N=bn, BLOCK_K=bk, EPI=self.epi, SPLIT=split,
-            num_warps=warps, num_stages=stages,
+            NORM=self.norm_eps is not None, num_warps=warps, num_stages=stages,
         )
         if split:
             _splitk_reduce_kernel[(self.M, triton.cdiv(self.N, 256))](
@@ -174,7 +207,7 @@ class Gemv:
             )
         return out
 
-    def tune(self, x, w, out, res=None, iters=20):
+    def tune(self, x, w, out, res=None, norm_w=None, iters=20):
         """Time each candidate (compiles it) and keep the fastest valid one."""
         best = None
         for cfg in self.CANDIDATES:
@@ -183,11 +216,11 @@ class Gemv:
             try:
                 self.set_config(cfg)
                 for _ in range(3):
-                    self(x, w, out, res)
+                    self(x, w, out, res, norm_w)
                 s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 s.record()
                 for _ in range(iters):
-                    self(x, w, out, res)
+                    self(x, w, out, res, norm_w)
                 e.record()
                 e.synchronize()
                 t = s.elapsed_time(e) / iters
@@ -206,8 +239,9 @@ class LmHeadArgmax:
 
     CANDIDATES = [(64, 128, 4, 4), (128, 128, 8, 3), (32, 256, 4, 3)]
 
-    def __init__(self, M, V, K, device):
+    def __init__(self, M, V, K, device, norm_eps=None):
         self.M, self.V, self.K, self.device = M, V, K, device
+        self.norm_eps = norm_eps
         self.set_config(self.CANDIDATES[0])
 
     def set_config(self, cfg):
@@ -216,27 +250,30 @@ class LmHeadArgmax:
         self.pval = torch.empty((self.M, self.tiles), dtype=torch.float32, device=self.device)
         self.pidx = torch.empty((self.M, self.tiles), dtype=torch.int32, device=self.device)
 
-    def __call__(self, x, w, tok):
+    def __call__(self, x, w, tok, norm_w=None):
+        assert (norm_w is not None) == (self.norm_eps is not None)
         bn, bk, warps, stages = self.cfg
         _lm_argmax_partial_kernel[(self.tiles,)](
-            x, w, self.pval, self.pidx, self.M, self.V, self.K, x.stride(0), w.stride(0), self.tiles,
-            BLOCK_M=_block_m(self.M), BLOCK_N=bn, BLOCK_K=bk, num_warps=warps, num_stages=stages,
+            x, w, self.pval, self.pidx, norm_w if norm_w is not None else w, self.norm_eps or 0.0,
+            self.M, self.V, self.K, x.stride(0), w.stride(0), self.tiles,
+            BLOCK_M=_block_m(self.M), BLOCK_N=bn, BLOCK_K=bk, NORM=self.norm_eps is not None,
+            num_warps=warps, num_stages=stages,
         )
         _lm_argmax_reduce_kernel[(self.M,)](self.pval, self.pidx, tok, self.tiles,
                                             BLOCK=triton.next_power_of_2(self.tiles), num_warps=8)
         return tok
 
-    def tune(self, x, w, tok, iters=10):
+    def tune(self, x, w, tok, norm_w=None, iters=10):
         best = None
         for cfg in self.CANDIDATES:
             try:
                 self.set_config(cfg)
                 for _ in range(2):
-                    self(x, w, tok)
+                    self(x, w, tok, norm_w)
                 s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 s.record()
                 for _ in range(iters):
-                    self(x, w, tok)
+                    self(x, w, tok, norm_w)
                 e.record()
                 e.synchronize()
                 t = s.elapsed_time(e) / iters

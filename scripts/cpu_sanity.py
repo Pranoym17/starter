@@ -62,12 +62,68 @@ def check(eng, prompts, n, ref=None):
     return steps
 
 
+def spec_logic_check(mod):
+    """Drive Engine._stream_spec with a mock model whose 'greedy token' is a deterministic
+    function of the KV-cache contents: spec output must equal plain greedy exactly."""
+    from types import SimpleNamespace
+
+    def f(prefix):  # toy greedy rule with repetition, so drafts get accepted sometimes
+        return (prefix[-1] * 3 + prefix[-2] + (len(prefix) % 5 == 0)) % 23
+
+    def plain(prompt, n):
+        seq = list(prompt)
+        for _ in range(n):
+            seq.append(f(seq))
+        return seq[len(prompt):]
+
+    rng = random.Random(1)
+    for B, S, N, T in [(1, 12, 40, 7), (3, 9, 33, 5), (4, 20, 2, 5), (2, 7, 1, 5), (5, 30, 64, 3)]:
+        prompts = [[rng.randrange(23) for _ in range(S)] for _ in range(B)]
+        cap = S + N + T
+        kv = [[None] * cap for _ in range(B)]
+        st = SimpleNamespace(B=B, S=S, spec_T=T)
+        st.ids_host = torch.zeros((B, S), dtype=torch.int64)
+        st.ids = torch.zeros((B, S), dtype=torch.int64)
+        st.pos = torch.zeros((1,), dtype=torch.int64)
+        st.tok = torch.zeros((B,), dtype=torch.int64)
+        st.host = torch.zeros((max(N, 1), B), dtype=torch.int64)
+        st.events = [mod._NullEvent() for _ in range(max(N, 1))]
+        st.v_event = mod._NullEvent()
+        for name, shape in (("v_tok", (B, T)), ("v_pos", (B,)), ("v_out", (B * T,))):
+            setattr(st, name, torch.zeros(shape, dtype=torch.int64))
+            setattr(st, name + "_host", torch.zeros(shape, dtype=torch.int64))
+
+        def prefill():
+            for b in range(B):
+                kv[b][:S] = st.ids[b].tolist()
+                st.tok[b] = f(kv[b][:S])
+
+        def verify():
+            for b in range(B):
+                p0 = int(st.v_pos[b])
+                assert 0 <= p0 and p0 + T <= cap, "verify beyond cache capacity"
+                assert all(v is not None for v in kv[b][:p0]), "reads an unwritten slot"
+                for t in range(T):
+                    kv[b][p0 + t] = int(st.v_tok[b, t])
+                    st.v_out[b * T + t] = f(kv[b][:p0 + t + 1])
+
+        st.prefill_graph = SimpleNamespace(replay=prefill)
+        st.verify_graph = SimpleNamespace(replay=verify)
+        steps = list(mod.Engine._stream_spec(None, st, prompts, N))
+        assert len(steps) == N and all(len(s) == B and all(type(t) is int for t in s) for s in steps)
+        got = [[steps[i][b] for i in range(N)] for b in range(B)]
+        want = [plain(p, N) for p in prompts]
+        assert got == want, f"spec mismatch B={B} S={S} N={N} T={T}"
+    print("  spec host logic: exact on 5 mock cases")
+
+
 def main():
     rng = random.Random(0)
     mk = lambda b, s: [[rng.randrange(1000) for _ in range(s)] for _ in range(b)]  # noqa: E731
     with tempfile.TemporaryDirectory() as d:
         make_model(d)
         mod = load_engine()
+        spec_logic_check(mod)
         for forced in ("-1", "0"):
             mod.FORCE_TIER = int(forced)
             eng = mod.Engine(d)

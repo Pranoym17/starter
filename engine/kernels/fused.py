@@ -24,18 +24,21 @@ def _bf(x):
 def _qk_norm_rope_kernel(
     qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr,
     q_out_ptr, k_cache_ptr, v_cache_ptr,
-    T, pos_base_from_ptr, eps,
+    T, eps,
     stride_qkv,                       # row stride of qkv [B*T, 6144]
     stride_qb, stride_qh, stride_qt,  # q_out [B, 32, T, 128] strides
     stride_cb, stride_ch, stride_cn,  # cache [B, 8, cap, 128] strides
-    NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr,
+    NQ: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr, POS_MODE: tl.constexpr,
 ):
-    """One program per (token row, head in [0, NQ + 2*NKV))."""
+    """One program per (token row, head in [0, NQ + 2*NKV)).
+    Position of token t of sequence b: POS_MODE 0 -> t, 1 -> pos[0] + t, 2 -> pos[b] + t."""
     row = tl.program_id(0)
     head = tl.program_id(1)
     b = row // T
     t = row % T
-    if pos_base_from_ptr:
+    if POS_MODE == 2:
+        pos = tl.load(pos_ptr + b).to(tl.int32) + t
+    elif POS_MODE == 1:
         pos = tl.load(pos_ptr).to(tl.int32) + t
     else:
         pos = t
@@ -79,17 +82,19 @@ def _qk_norm_rope_kernel(
 
 
 def qk_norm_rope_cache(qkv, q_norm_w, k_norm_w, cos, sin, pos, q_out, k_cache, v_cache, B, T, eps,
-                       pos_from_ptr: bool):
-    """qkv [B*T, 6144] BF16 -> q_out [B, 32, T, 128] (any strides) normed + rotated; K normed +
-    rotated and V written into caches at positions (pos[0] if pos_from_ptr else 0) + t.
+                       pos_mode: int, q_strides=None):
+    """qkv [B*T, 6144] BF16 -> q_out normed + rotated, indexed (b, head, t) through q_strides
+    (default: q_out is [B, 32, T, 128]); K normed + rotated and V written into the caches
+    [B, 8, cap, 128] at position t (pos_mode 0), pos[0] + t (1) or pos[b] + t (2).
     cos/sin are the [cap, 128] BF16 tables from the reference rotary module."""
-    nq, nkv, D = q_out.shape[1], k_cache.shape[1], q_out.shape[3]
+    nkv, D = k_cache.shape[1], k_cache.shape[3]
+    nq = qkv.shape[1] // D - 2 * nkv
+    sb, sh, st = q_strides or (q_out.stride(0), q_out.stride(1), q_out.stride(2))
     _qk_norm_rope_kernel[(B * T, nq + 2 * nkv)](
         qkv, q_norm_w, k_norm_w, cos, sin, pos, q_out, k_cache, v_cache,
-        T, pos_from_ptr, eps, qkv.stride(0),
-        q_out.stride(0), q_out.stride(1), q_out.stride(2),
+        T, eps, qkv.stride(0), sb, sh, st,
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-        NQ=nq, NKV=nkv, D=D, num_warps=1,
+        NQ=nq, NKV=nkv, D=D, POS_MODE=pos_mode, num_warps=1,
     )
 
 
