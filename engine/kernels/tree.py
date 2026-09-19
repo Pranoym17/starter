@@ -73,14 +73,17 @@ def _tree_qk_kernel(qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, base_ptr, depth_p
 def _tree_attn_partial_kernel(q_ptr, k_ptr, v_ptr, base_ptr, anc_ptr, acc_ptr, ml_ptr,
                               stride_kb, stride_kh, stride_kn, n_kv_heads, n_splits, chunk, scale,
                               T: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr,
-                              QPAD: tl.constexpr):
-    """Rows of a program: (t = r // GROUP, head kvh*GROUP + r % GROUP). Keys: cache slots < base are
-    visible to all rows; block slot base + j is visible to row t iff bit j of anc[b, t]."""
+                              QPAD: tl.constexpr, N_RB: tl.constexpr):
+    """Rows of a program: (t = r // GROUP, head kvh*GROUP + r % GROUP) for r in its row block (at
+    most 32 rows: Triton 3.1 aborts compiling 64-row Hopper MMAs with a register operand here).
+    Keys: cache slots < base are visible to all rows; block slot base + j is visible to row t iff bit
+    j of anc[b, t]."""
     b = tl.program_id(0)
     kvh = tl.program_id(1)
-    split = tl.program_id(2)
+    split = tl.program_id(2) // N_RB
+    rb = tl.program_id(2) % N_RB
     base = tl.load(base_ptr + b).to(tl.int32)
-    rows = tl.arange(0, QPAD)
+    rows = rb * QPAD + tl.arange(0, QPAD)
     dims = tl.arange(0, D)
     t = rows // GROUP
     row_ok = rows < T * GROUP
@@ -151,7 +154,7 @@ def _compact_kernel(k_ptr, v_ptr, base_ptr, src_ptr, cnt_ptr, stride_kl, stride_
     h = tl.arange(0, NKV)
     dd = tl.arange(0, D)
     off_hd = h[:, None] * stride_kh + dd[None, :]
-    lb = layer * stride_kl + b * stride_kb
+    lb = layer.to(tl.int64) * stride_kl + b.to(tl.int64) * stride_kb   # > 2^31 elements at large B*cap
     for k in range(1, cnt):
         s = tl.load(src_ptr + b * T + k).to(tl.int32)
         if s != k:
@@ -172,16 +175,18 @@ class TreeAttention:
         self.acc = torch.empty((rows * self.splits, 128), dtype=torch.float32, device=device)
         self.ml = torch.empty((rows * self.splits, 2), dtype=torch.float32, device=device)
         self.scale = 1.0 / math.sqrt(128)
-        self.qpad = max(16, triton.next_power_of_2(T * 4))
+        rows_total = triton.next_power_of_2(T * 4)
+        self.qpad = max(16, min(32, rows_total))              # <= 32 rows per program (see kernel)
+        self.n_rb = max(1, rows_total // self.qpad)
 
     def __call__(self, q, k_cache, v_cache, base, anc, out):
         """q, out [B, T, 32, 128] BF16; base int64[B]; anc int32[B, T]."""
         B = self.batch
-        _tree_attn_partial_kernel[(B, self.n_kv, self.splits)](
+        _tree_attn_partial_kernel[(B, self.n_kv, self.splits * self.n_rb)](
             q, k_cache, v_cache, base, anc, self.acc, self.ml,
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), self.n_kv, self.splits, self.chunk, self.scale,
-            T=self.T, GROUP=4, D=128, BLOCK_N=self.block_n, QPAD=self.qpad,
-            num_warps=4 if self.qpad <= 32 else 8, num_stages=2,
+            T=self.T, GROUP=4, D=128, BLOCK_N=self.block_n, QPAD=self.qpad, N_RB=self.n_rb,
+            num_warps=4, num_stages=2,
         )
         _tree_merge_kernel[(B * self.T * self.n_kv * 4,)](
             self.acc, self.ml, out, self.splits, SPLITS=max(2, triton.next_power_of_2(self.splits)), D=128,

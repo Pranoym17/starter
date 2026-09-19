@@ -26,10 +26,14 @@ from kernels.fast import attn_split_plan, split_plan
 
 @triton.jit
 def _wait(cnt_ptr, target, err_ptr, LIMIT: tl.constexpr):
+    """Spin until the counter reaches target. Bounded, and once any CTA has flagged an error every
+    later wait returns at once, so a broken schedule costs milliseconds, never the warmup budget."""
     c = tl.atomic_add(cnt_ptr, 0, sem="acquire")
+    e = tl.atomic_add(err_ptr, 0, sem="relaxed")
     it = 0
-    while (c < target) & (it < LIMIT):
+    while (c < target) & (it < LIMIT) & (e == 0):
         c = tl.atomic_add(cnt_ptr, 0, sem="acquire")
+        e = tl.atomic_add(err_ptr, 0, sem="relaxed")
         it += 1
     if c < target:
         tl.atomic_xchg(err_ptr, 1)
@@ -77,14 +81,15 @@ def _mega_kernel(
     n_d = d_tiles * d_split
     for l in range(0, NL):
         op = 1 + 5 * l
-        kc = kc_ptr + l * stride_kl
-        vc = vc_ptr + l * stride_kl
+        l64 = l.to(tl.int64)                                    # layer offsets exceed 2^31 elements
+        kc = kc_ptr + l64 * stride_kl
+        vc = vc_ptr + l64 * stride_kl
         # qkv = RMSNorm_1(x) @ Wqkv.T
         if c < n_qkv:
             _wait(done_ptr + prev, ep * prev_n, err_ptr, LIMIT)
             for u in range(c, n_qkv, P):
-                _gemm_unit(u // qkv_split, u % qkv_split, x_ptr, wqkv_ptr + l * NQKV * H, qkv_ptr, qkv_ptr,
-                           part_ptr, gticket_ptr, ln1_ptr + l * H, ss_ptr + (2 * l) * M, ss_ptr,
+                _gemm_unit(u // qkv_split, u % qkv_split, x_ptr, wqkv_ptr + l64 * NQKV * H, qkv_ptr, qkv_ptr,
+                           part_ptr, gticket_ptr, ln1_ptr + l64 * H, ss_ptr + (2 * l) * M, ss_ptr,
                            eps, M, NQKV, H, H, H, NQKV, qkv_chunk, qkv_split, NQKV,
                            BLOCK_M, BN, BK, 0, True, False, True)
                 _arrive(done_ptr + op)
@@ -95,7 +100,7 @@ def _mega_kernel(
                 b = u // (n_kv * a_splits)
                 rem = u % (n_kv * a_splits)
                 _attn_unit(b, rem // a_splits, rem % a_splits,
-                           qkv_ptr, qn_ptr + l * 128, kn_ptr + l * 128, cos_ptr, sin_ptr, pos_ptr, kc, vc,
+                           qkv_ptr, qn_ptr + l64 * 128, kn_ptr + l64 * 128, cos_ptr, sin_ptr, pos_ptr, kc, vc,
                            aacc_ptr, aml_ptr, aticket_ptr, attn_ptr,
                            NQKV, stride_kb, stride_kh, stride_kn, n_kv, a_splits, a_chunk, scale, eps,
                            4, 128, 64, QPAD, SPLITS_P2, True)
@@ -104,7 +109,7 @@ def _mega_kernel(
         if c < n_o:
             _wait(done_ptr + op + 1, ep * n_attn, err_ptr, LIMIT)
             for u in range(c, n_o, P):
-                _gemm_unit(u // o_split, u % o_split, attn_ptr, wo_ptr + l * H * QS, x_ptr, x_ptr,
+                _gemm_unit(u // o_split, u % o_split, attn_ptr, wo_ptr + l64 * H * QS, x_ptr, x_ptr,
                            part_ptr, gticket_ptr, ln2_ptr, ss_ptr, ss_ptr + (2 * l + 1) * M,
                            eps, M, H, QS, QS, QS, H, o_chunk, o_split, H,
                            BLOCK_M, BN, BK, 1, False, True, True)
@@ -113,8 +118,8 @@ def _mega_kernel(
         if c < n_gu:
             _wait(done_ptr + op + 2, ep * n_o, err_ptr, LIMIT)
             for u in range(c, n_gu, P):
-                _gemm_unit(u // gu_split, u % gu_split, x_ptr, wgu_ptr + l * 2 * I * H, act_ptr, act_ptr,
-                           part_ptr, gticket_ptr, ln2_ptr + l * H, ss_ptr + (2 * l + 1) * M, ss_ptr,
+                _gemm_unit(u // gu_split, u % gu_split, x_ptr, wgu_ptr + l64 * 2 * I * H, act_ptr, act_ptr,
+                           part_ptr, gticket_ptr, ln2_ptr + l64 * H, ss_ptr + (2 * l + 1) * M, ss_ptr,
                            eps, M, I, H, H, H, I, gu_chunk, gu_split, I,
                            BLOCK_M, BN, BK, 2, True, False, True)
                 _arrive(done_ptr + op + 3)
@@ -122,7 +127,7 @@ def _mega_kernel(
         if c < n_d:
             _wait(done_ptr + op + 3, ep * n_gu, err_ptr, LIMIT)
             for u in range(c, n_d, P):
-                _gemm_unit(u // d_split, u % d_split, act_ptr, wd_ptr + l * H * I, x_ptr, x_ptr,
+                _gemm_unit(u // d_split, u % d_split, act_ptr, wd_ptr + l64 * H * I, x_ptr, x_ptr,
                            part_ptr, gticket_ptr, ln2_ptr, ss_ptr, ss_ptr + (2 * l + 2) * M,
                            eps, M, H, I, I, I, H, d_chunk, d_split, H,
                            BLOCK_M, BN, BK, 1, False, True, True)
@@ -160,7 +165,7 @@ class MegaStep:
 
     BN, BK, BN_LM, BK_LM = 32, 128, 64, 128
 
-    def __init__(self, eng, st, programs=None, limit=1 << 21, num_warps=4, num_stages=3):
+    def __init__(self, eng, st, programs=None, limit=1 << 18, num_warps=4, num_stages=3):
         dev = st.k_all.device
         B, H, I, V = st.B, eng.embed.shape[1], eng.inter, eng.lm_head.shape[0]
         NQKV, QS = eng.w_qkv_all.shape[1], eng.w_o_all.shape[2]

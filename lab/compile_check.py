@@ -165,6 +165,21 @@ def cases(quick):
             m()
             print(f"    mega B={B}: {m.describe()}")
         yield f"mega B={B}", run_mega
+        # tree speculation kernels (T = 16 for B = 1, 8 for B <= 8)
+        Tt = 16 if B == 1 else 8
+        if B * Tt <= 64:
+            from kernels import tree
+
+            def run_tree(B=B, T=Tt, cap=cap):
+                tree.tree_qk(t(B * T, 6144), t(D), t(D), t(cap, D), t(cap, D), t(B, dtype=torch.int64),
+                             t(B * T, dtype=torch.int64), t(B, T, NQ, D), t(B, NKV, cap, D), t(B, NKV, cap, D),
+                             B, T, 1e-6)
+                tree.TreeAttention(B, T, NKV, cap, "cpu", 132)(t(B, T, NQ, D), t(B, NKV, cap, D), t(B, NKV, cap, D),
+                                                               t(B, dtype=torch.int64),
+                                                               t(B, T, dtype=torch.int32), t(B, T, NQ, D))
+                tree.compact(t(2, B, NKV, cap, D), t(2, B, NKV, cap, D), t(B, dtype=torch.int64),
+                             t(B, T, dtype=torch.int32), t(B, dtype=torch.int32), T)
+            yield f"tree B={B} T={Tt}", run_tree
         for T in (5, 7):
             if B * T > 64:
                 continue

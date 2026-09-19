@@ -37,3 +37,17 @@ launch overhead. Next: forced-tier diagnostic run(s) to measure T5/T6 in isolati
   only if warmup teacher-forcing is exact and it is >= 8% faster. Risk to watch: 25% spread gate.
 
 Current best: 901.97 · target 1200 · gap 1.33x
+
+## Run 5 (4e0bd06): FAILED - candidate_error (post-mortem)
+Root cause, reproduced offline: Triton 3.1's compiler *aborts the process* (LLVM UNREACHABLE:
+"SharedEncodingAttr builder when the MMAEncodingAttr is Hopper has not been implemented yet") when
+compiling the tree-attention kernel with 64 query rows (B=1 -> T=16 -> 16*4 rows: a Hopper 64-row MMA
+with a register operand). A compiler abort kills the engine during warmup; no try/except can catch it.
+The lab never compiled the tree kernels for sm_90 before the push (only numerics) - process gap.
+Fixes: tree attention processes <= 32 query rows per program (grid row blocks; same per-row math).
+Also found by audit: T6 megakernel and KV compaction computed layer offsets in int32 -> overflow and
+out-of-bounds access (sticky CUDA error = whole engine dead) once B*capacity >~ 30k tokens (e.g. a
+hidden b16x2048). Now int64. T6 spins now short-circuit on the error flag (LIMIT 2^18) and the host
+checks the flag right after the first eager T6 steps; hard warmup deadline 200 s.
+The platform re-ran run 4's commit (5640b751): 893.36 -> run-to-run noise ~1%.
+Rule from now on: every push runs the FULL sm_90 compile sweep (all kernels, B = 1..64) first.

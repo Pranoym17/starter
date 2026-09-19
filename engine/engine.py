@@ -83,6 +83,7 @@ SPEC_MAX_ROWS = 64        # verify runs B*(k+1) rows through the skinny GEMMs
 SPEC_CHECK_TOKENS = 128   # warmup tokens used to validate and time speculative decoding
 SPEC_MIN_GAIN = 0.92      # keep spec only if its warmup wall time is below this fraction of plain
 WARMUP_SOFT_S = 170.0     # past this many seconds since load start, skip optional warmup work
+WARMUP_HARD_S = 200.0     # past this, keep the best tier found so far (load + warmup limit: 300 s)
 SPEC_TREE = os.environ.get("ENGINE_TREE", "1") != "0"   # exact token-tree speculation (T5/T6)
 TREE_CHECK_TOKENS = 128   # warmup tokens used to validate and time tree speculation
 TREE_MIN_GAIN = 0.92      # keep it only if its warmup wall time is below this fraction of plain
@@ -663,6 +664,8 @@ class Engine:
                             self._verify(st)
                 torch.cuda.current_stream().wait_stream(side)
                 torch.cuda.synchronize()
+                if st.mega and int(st.megastep.err.item()) != 0:
+                    raise RuntimeError(f"T6 dependency spin expired ({st.megastep.describe()})")
                 if st.tree_T:
                     try:
                         with torch.cuda.stream(side):
@@ -1003,6 +1006,9 @@ class Engine:
             order = [1]
         passing = []                       # (wall ms for K tokens, tier, per-step GPU timings)
         for n, tier in enumerate(order):
+            if passing and time.perf_counter() - self.t_load0 > WARMUP_HARD_S:
+                log(f"warmup deadline: stop comparing tiers after {len(passing)} passing")
+                break
             try:
                 st = self._build(B, S, N, tier)
                 steps = list(self._stream(st, input_ids, K))
