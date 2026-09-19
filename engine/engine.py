@@ -10,8 +10,11 @@ Tiers, fastest first. On the first call of a shape (the platform's untimed warmu
 validates tiers against the loaded native model by teacher-forcing their own tokens, falling
 back a tier on any exception, non-finite logit, or margin above MARGIN_LIMIT, and keeps the
 faster of the two best passing tiers:
-  T4  T3 + Triton skinny-GEMM decode (fused RMSNorm prologues, residual / SwiGLU epilogues,
-      LM head + argmax), optionally with exact prompt-lookup speculative decoding
+  T5  five kernels per layer: norm statistics carried in epilogues, split-K reduced by the last CTA
+      (no reduce launches), attention with fused q/k-norm + RoPE + KV write + merge, LM head +
+      argmax + position advance in one launch
+  T4  T3 + Triton skinny-GEMM decode (residual / SwiGLU epilogues, LM head + argmax), optionally
+      with exact prompt-lookup speculative decoding
   T3  CUDA graphs + fused Triton kernels
   T2  CUDA graphs + Triton norm / decode attention, torch elementwise ops
   T1  eager, torch ops only (reference-style SDPA over the cache)
@@ -45,6 +48,11 @@ try:
     _GEMV_ERR = None
 except Exception as _exc:
     _GEMV_ERR = repr(_exc)[:200]
+try:
+    from kernels import fast as _fast
+    _FAST_ERR = None
+except Exception as _exc:
+    _FAST_ERR = repr(_exc)[:200]
 
 DEVICE = os.environ.get("ENGINE_DEVICE", "cuda:0")
 CUDA = DEVICE.startswith("cuda")
@@ -57,7 +65,7 @@ CHECK_ROWS = 4            # rows run through the native loop for the divergence 
 MARGIN_LIMIT = 1.0        # native's own drift is <= 0.75; the judge's margin is 2.0
 PREFILL_TOKENS = 16384    # prefill processes at most this many tokens per row-chunk
 FORCE_TIER = int(os.environ.get("ENGINE_TIER", "-1"))
-SPEC = os.environ.get("ENGINE_SPEC", "1") != "0"
+SPEC = os.environ.get("ENGINE_SPEC", "0") != "0"   # prompt-lookup spec: off until tree/lookahead
 SPEC_MAX_ROWS = 64        # verify runs B*(k+1) rows through the skinny GEMMs
 SPEC_CHECK_TOKENS = 128   # warmup tokens used to validate and time speculative decoding
 SPEC_MIN_GAIN = 0.92      # keep spec only if its warmup wall time is below this fraction of plain
@@ -65,9 +73,10 @@ WARMUP_SOFT_S = 170.0     # past this many seconds since load start, skip option
 
 GEMV_MAX_B = 64          # T4's skinny-GEMM decode path covers batches up to this
 
-#            graphs  triton  fused  gemv
-TIERS = {4: (True, True, True, True), 3: (True, True, True, False),
-         2: (True, True, False, False), 1: (False, False, False, False)}
+#            graphs  triton  fused  gemv   fast
+TIERS = {5: (True, True, True, False, True), 4: (True, True, True, True, False),
+         3: (True, True, True, False, False), 2: (True, True, False, False, False),
+         1: (False, False, False, False, False)}
 
 
 def log(msg):
@@ -82,6 +91,31 @@ def _rotate_half(x):
 def _repeat_kv(x):
     b, h, s, d = x.shape
     return x[:, :, None].expand(b, h, N_HEADS // N_KV, s, d).reshape(b, N_HEADS, s, d)
+
+
+def _time_configs(obj, configs, run, iters=20):
+    """Set each config on obj, time `run(obj)` with CUDA events, keep the fastest that works."""
+    best = None
+    for cfg in configs:
+        try:
+            obj.set_config(cfg)
+            for _ in range(3):
+                run(obj)
+            s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            s.record()
+            for _ in range(iters):
+                run(obj)
+            e.record()
+            e.synchronize()
+            t = s.elapsed_time(e) / iters
+            if best is None or t < best[0]:
+                best = (t, cfg)
+        except Exception:
+            continue
+    if best is None:
+        raise RuntimeError(f"no config ran for {type(obj).__name__}")
+    obj.set_config(best[1])
+    return best
 
 
 class _NullEvent:
@@ -105,13 +139,13 @@ class _State:
 
     def __init__(self, eng, B, S, N, tier):
         self.B, self.S, self.N, self.tier = B, S, N, tier
-        self.graphs, self.triton, self.fused, self.gemv = TIERS[tier]
+        self.graphs, self.triton, self.fused, self.gemv, self.fast = TIERS[tier]
         # speculative verify width T = k + 1 (0 = off); B*T rows must fit the skinny GEMMs
         T = 7 if B == 1 else 5
         self.spec_T = T if (self.gemv and SPEC and N > 1 and B * T <= SPEC_MAX_ROWS
                             and time.perf_counter() - eng.t_load0 < WARMUP_SOFT_S - 60) else 0
         self.spec = False
-        cap = S + N + self.spec_T
+        cap = self.capacity = S + N + self.spec_T
         n_layers = len(eng.layers)
         self.k_cache = [torch.zeros((B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE) for _ in range(n_layers)]
         self.v_cache = [torch.zeros((B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE) for _ in range(n_layers)]
@@ -132,8 +166,11 @@ class _State:
         self.prefill_graph = self.decode_graph = self.verify_graph = None
         self.prefill_logits = None
         self.compile_s = self.capture_s = 0.0
+        self.gqa = eng.gqa_flash and self.triton
         if self.gemv:
             self.plans, self.qkv_buf, self.act_buf = eng._make_plans(B)
+        if self.fast:
+            eng._fast_plans(self)
         if self.spec_T:
             T = self.spec_T
             self.vplans, self.v_qkv, self.v_act = eng._make_plans(B * T)
@@ -184,24 +221,25 @@ class Engine:
         self.state = None
         self.tier = None
         self._tuned = {}
+        self._tuned_fast = {}
+        self.gqa_flash = self._probe_gqa_flash()
         self.load_s = time.perf_counter() - t0
         log(f"loaded in {self.load_s:.1f}s; kernels {'ok' if _KERNEL_ERR is None else 'UNAVAILABLE ' + _KERNEL_ERR}; "
-            f"fused {'ok' if _FUSED_ERR is None else 'UNAVAILABLE ' + _FUSED_ERR}")
+            f"fused {'ok' if _FUSED_ERR is None else 'UNAVAILABLE ' + _FUSED_ERR}; "
+            f"T5 {'ok' if _FAST_ERR is None else 'UNAVAILABLE ' + _FAST_ERR}; gqa_flash={self.gqa_flash}")
 
     def _make_plans(self, M):
-        """Skinny-GEMM plans for M rows (tuned once per M; tuning compiles every kept config).
-        qkv and gate/up fuse the preceding RMSNorm; the LM head fuses the final norm + argmax."""
+        """T4 skinny-GEMM plans for M rows (tuned once per M; tuning compiles every kept config)."""
         H, I = self.embed.shape[1], self.inter
         L = self.layers[0]
-        eps = self.eps
         qkv_buf = torch.empty((M, L.w_qkv.shape[0]), dtype=BF16, device=DEVICE)
         act_buf = torch.empty((M, I), dtype=BF16, device=DEVICE)
         plans = {
-            "qkv": Gemv(M, L.w_qkv.shape[0], H, EPI_NONE, DEVICE, self.sm_count, norm_eps=eps),
+            "qkv": Gemv(M, L.w_qkv.shape[0], H, EPI_NONE, DEVICE, self.sm_count),
             "o": Gemv(M, H, L.w_o.shape[1], EPI_RES, DEVICE, self.sm_count),
-            "gu": Gemv(M, I, H, EPI_SILU, DEVICE, self.sm_count, norm_eps=eps),
+            "gu": Gemv(M, I, H, EPI_SILU, DEVICE, self.sm_count),
             "down": Gemv(M, H, I, EPI_RES, DEVICE, self.sm_count),
-            "lm": LmHeadArgmax(M, self.lm_head.shape[0], H, DEVICE, norm_eps=eps),
+            "lm": LmHeadArgmax(M, self.lm_head.shape[0], H, DEVICE),
         }
         cached = self._tuned.get(M)
         if cached is None:
@@ -212,11 +250,11 @@ class Engine:
             scratch = torch.empty((M, H), dtype=BF16, device=DEVICE)
             tok = torch.empty((M,), dtype=torch.int64, device=DEVICE)
             jobs = {
-                "qkv": lambda pl: pl.tune(rnd(H), L.w_qkv, qkv_buf, norm_w=L.ln1),
+                "qkv": lambda pl: pl.tune(rnd(H), L.w_qkv, qkv_buf),
                 "o": lambda pl: pl.tune(rnd(L.w_o.shape[1]), L.w_o, scratch, res),
-                "gu": lambda pl: pl.tune(rnd(H), L.w_gu, act_buf, norm_w=L.ln2),
+                "gu": lambda pl: pl.tune(rnd(H), L.w_gu, act_buf),
                 "down": lambda pl: pl.tune(rnd(I), L.w_down, scratch, res),
-                "lm": lambda pl: pl.tune(rnd(H), self.lm_head, tok, norm_w=self.final_norm),
+                "lm": lambda pl: pl.tune(rnd(H), self.lm_head, tok),
             }
             cached, desc = {}, []
             for k, plan in plans.items():
@@ -230,21 +268,96 @@ class Engine:
         return plans, qkv_buf, act_buf
 
     def _decode_gemv(self, st):
-        """T4 decode step: fused-norm skinny GEMMs, fused epilogues, residual stream updated in place."""
+        """T4 decode step (run 2's form): Triton RMSNorm + skinny GEMMs with fused epilogues."""
         B = st.B
         p = st.plans
         x = F.embedding(st.tok, self.embed)
         for i, L in enumerate(self.layers):
             kc, vc = st.k_cache[i], st.v_cache[i]
-            qkv = p["qkv"](x, L.w_qkv, st.qkv_buf, norm_w=L.ln1)
+            h = rms_norm_rows(x, L.ln1, self.eps).view(B, -1)
+            qkv = p["qkv"](h, L.w_qkv, st.qkv_buf)
             qk_norm_rope_cache(qkv, L.q_norm, L.k_norm, st.cos, st.sin, st.pos, st.q_buf, kc, vc,
                                B, 1, self.eps, 1)
             a = st.attn(st.q_buf.view(B, N_HEADS, HEAD_DIM), kc, vc, st.pos, st.attn_out)
             p["o"](a.view(B, Q_SIZE), L.w_o, x, res=x)
-            act = p["gu"](x, L.w_gu, st.act_buf, norm_w=L.ln2)
+            h = rms_norm_rows(x, L.ln2, self.eps).view(B, -1)
+            act = p["gu"](h, L.w_gu, st.act_buf)
             p["down"](act, L.w_down, x, res=x)
-        p["lm"](x, self.lm_head, st.tok, norm_w=self.final_norm)
+        h = rms_norm_rows(x, self.final_norm, self.eps).view(B, -1)
+        p["lm"](h, self.lm_head, st.tok)
         st.pos.add_(1)
+
+    # ------------------------------------------------------------------ T5
+    def _fast_plans(self, st):
+        """T5 kernels for batch B; configs (tile, warps, stages, split-K) tuned once per B by timing."""
+        B, H, I, V = st.B, self.embed.shape[1], self.inter, self.lm_head.shape[0]
+        L = self.layers[0]
+        st.x = torch.empty((B, H), dtype=BF16, device=DEVICE)
+        st.ss = torch.zeros((2 * len(self.layers) + 1, B), dtype=torch.float32, device=DEVICE)
+        st.qkv_buf = torch.empty((B, L.w_qkv.shape[0]), dtype=BF16, device=DEVICE)
+        st.act_buf = torch.empty((B, I), dtype=BF16, device=DEVICE)
+        fg = {
+            "qkv": _fast.FastGemm(B, L.w_qkv.shape[0], H, _fast.EPI_NONE, DEVICE, norm=True),
+            "o": _fast.FastGemm(B, H, L.w_o.shape[1], _fast.EPI_RES, DEVICE, ss_out=True),
+            "gu": _fast.FastGemm(B, I, H, _fast.EPI_SILU, DEVICE, norm=True),
+            "down": _fast.FastGemm(B, H, I, _fast.EPI_RES, DEVICE, ss_out=True),
+        }
+        for g in fg.values():
+            g.eps = self.eps
+        lm = _fast.FastLmHead(B, V, H, DEVICE)
+        lm.eps = self.eps
+        cached = self._tuned_fast.get(B)
+        if cached is None:
+            cached = {k: g.cfg for k, g in fg.items()}
+            cached["lm"] = lm.cfg
+            if CUDA and time.perf_counter() - self.t_load0 < WARMUP_SOFT_S - 60:
+                t0 = time.perf_counter()
+                gen = torch.Generator(device=DEVICE).manual_seed(0)
+                rnd = lambda n: torch.randn((B, n), generator=gen, device=DEVICE).to(BF16)  # noqa: E731
+                ss = torch.full((B,), float(H), dtype=torch.float32, device=DEVICE)
+                ss_out = torch.zeros((B,), dtype=torch.float32, device=DEVICE)
+                scratch = torch.zeros((B, H), dtype=BF16, device=DEVICE)
+                tok = torch.zeros((B,), dtype=torch.int64, device=DEVICE)
+                posb = torch.zeros((1,), dtype=torch.int64, device=DEVICE)
+                jobs = {
+                    "qkv": lambda g: g(rnd(H), L.w_qkv, st.qkv_buf, norm_w=L.ln1, ss_in=ss),
+                    "o": lambda g: g(rnd(L.w_o.shape[1]), L.w_o, scratch, res=scratch, ss_out=ss_out),
+                    "gu": lambda g: g(rnd(H), L.w_gu, st.act_buf, norm_w=L.ln2, ss_in=ss),
+                    "down": lambda g: g(rnd(I), L.w_down, scratch, res=scratch, ss_out=ss_out),
+                }
+                desc = []
+                for k, g in fg.items():
+                    t, cfg = _time_configs(g, g.candidates(), jobs[k])
+                    cached[k] = cfg
+                    desc.append(f"{k}={cfg[0]}x{cfg[1]}w{cfg[2]}s{cfg[3]}k{cfg[4]}:{t * 1e3:.0f}us")
+                xl = rnd(H)
+                t, cfg = _time_configs(lm, lm.candidates(),
+                                       lambda m: m(xl, self.lm_head, tok, self.final_norm, ss, posb, False))
+                cached["lm"] = cfg
+                desc.append(f"lm={cfg[0]}x{cfg[1]}:{t * 1e3:.0f}us")
+                log(f"T5 tuned B={B} in {time.perf_counter() - t0:.1f}s: {' '.join(desc)}")
+            self._tuned_fast[B] = cached
+        for k, g in fg.items():
+            g.set_config(cached[k])
+        lm.set_config(cached["lm"])
+        st.fg, st.flm = fg, lm
+        st.fattn = _fast.FastAttention(B, N_KV, st.capacity, DEVICE, self.sm_count)
+
+    def _decode_fast(self, st):
+        """T5 decode step: 1 + 5 per layer + 1 launches. Norm statistics live in st.ss:
+        slot 2i = input_layernorm of layer i, 2i+1 = post_attention_layernorm, last = final norm."""
+        B = st.B
+        g = st.fg
+        x = st.x
+        _fast.embed_ss(st.tok, self.embed, x, st.ss)
+        for i, L in enumerate(self.layers):
+            kc, vc = st.k_cache[i], st.v_cache[i]
+            qkv = g["qkv"](x, L.w_qkv, st.qkv_buf, norm_w=L.ln1, ss_in=st.ss[2 * i])
+            a = st.fattn(qkv, L.q_norm, L.k_norm, st.cos, st.sin, st.pos, kc, vc, st.attn_out, self.eps)
+            g["o"](a.view(B, Q_SIZE), L.w_o, x, res=x, ss_out=st.ss[2 * i + 1])
+            act = g["gu"](x, L.w_gu, st.act_buf, norm_w=L.ln2, ss_in=st.ss[2 * i + 1])
+            g["down"](act, L.w_down, x, res=x, ss_out=st.ss[2 * i + 2])
+        st.flm(x, self.lm_head, st.tok, self.final_norm, st.ss[2 * len(self.layers)], st.pos, True)
 
     def _verify(self, st):
         """Speculative verify: T tokens per sequence (st.v_tok) at positions st.v_pos[b] + t.
@@ -255,14 +368,17 @@ class Engine:
         q_strides = (T * Q_SIZE, HEAD_DIM, Q_SIZE)               # v_q is [B, T, 32, 128]
         for i, L in enumerate(self.layers):
             kc, vc = st.k_cache[i], st.v_cache[i]
-            qkv = p["qkv"](x, L.w_qkv, st.v_qkv, norm_w=L.ln1)
+            h = rms_norm_rows(x, L.ln1, self.eps).view(B * T, -1)
+            qkv = p["qkv"](h, L.w_qkv, st.v_qkv)
             qk_norm_rope_cache(qkv, L.q_norm, L.k_norm, st.cos, st.sin, st.v_pos, st.v_q, kc, vc,
                                B, T, self.eps, 2, q_strides=q_strides)
             a = st.vattn(st.v_q, kc, vc, st.v_pos, st.v_attn_out)
             p["o"](a.view(B * T, Q_SIZE), L.w_o, x, res=x)
-            act = p["gu"](x, L.w_gu, st.v_act, norm_w=L.ln2)
+            h = rms_norm_rows(x, L.ln2, self.eps).view(B * T, -1)
+            act = p["gu"](h, L.w_gu, st.v_act)
             p["down"](act, L.w_down, x, res=x)
-        p["lm"](x, self.lm_head, st.v_out, norm_w=self.final_norm)
+        h = rms_norm_rows(x, self.final_norm, self.eps).view(B * T, -1)
+        p["lm"](h, self.lm_head, st.v_out)
 
     # ------------------------------------------------------------------ building blocks
     def _norm(self, st, x2d, w, heads=1):
@@ -279,6 +395,40 @@ class Engine:
         if st.fused:
             return silu_mul(gu, self.inter)
         return F.silu(gu[:, :self.inter]) * gu[:, self.inter:]
+
+    @staticmethod
+    def _sdpa_causal(st, q, k, v):
+        """Causal prompt attention. With GQA-native flash (torch 2.5 enable_gqa) the 8 KV heads are
+        indexed directly - the same arithmetic as the reference's repeat_kv + flash, without the copy."""
+        if st.gqa:
+            return F.scaled_dot_product_attention(q.contiguous(), k.contiguous(), v.contiguous(),
+                                                  is_causal=True, scale=HEAD_DIM ** -0.5, enable_gqa=True)
+        return F.scaled_dot_product_attention(q.contiguous(), _repeat_kv(k), _repeat_kv(v),
+                                              is_causal=True, scale=HEAD_DIM ** -0.5)
+
+    @staticmethod
+    def _sdpa_last(st, q, k, v):
+        if st.gqa:
+            return F.scaled_dot_product_attention(q.contiguous(), k.contiguous(), v.contiguous(),
+                                                  scale=HEAD_DIM ** -0.5, enable_gqa=True)
+        return F.scaled_dot_product_attention(q.contiguous(), _repeat_kv(k), _repeat_kv(v), scale=HEAD_DIM ** -0.5)
+
+    def _probe_gqa_flash(self):
+        """True if torch's flash backend runs GQA natively here and matches repeat_kv exactly."""
+        if not CUDA:
+            return False
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            g = torch.Generator(device=DEVICE).manual_seed(0)
+            q = torch.randn((2, N_HEADS, 70, HEAD_DIM), generator=g, device=DEVICE).to(BF16)
+            k = torch.randn((2, N_KV, 70, HEAD_DIM), generator=g, device=DEVICE).to(BF16)
+            v = torch.randn((2, N_KV, 70, HEAD_DIM), generator=g, device=DEVICE).to(BF16)
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=HEAD_DIM ** -0.5, enable_gqa=True)
+            ref = F.scaled_dot_product_attention(q, _repeat_kv(k), _repeat_kv(v), is_causal=True, scale=HEAD_DIM ** -0.5)
+            return bool(torch.equal(a, ref))
+        except Exception:
+            return False
 
     def _prefill(self, st):
         """Prompt forward in row chunks; fills KV [0, S), writes token 0 to st.tok, returns logits."""
@@ -309,16 +459,12 @@ class Engine:
                     vc[:, :, :S].copy_(v)
                 if i == last_layer:
                     # only the last position reaches the LM head: its causal row sees every key
-                    a = F.scaled_dot_product_attention(
-                        q[:, :, -1:].contiguous(), _repeat_kv(kc[:, :, :S]), _repeat_kv(vc[:, :, :S]),
-                        scale=HEAD_DIM ** -0.5)
+                    a = self._sdpa_last(st, q[:, :, -1:], kc[:, :, :S], vc[:, :, :S])
                     x = x.view(b, S, -1)[:, -1] + F.linear(a.reshape(b, Q_SIZE), L.w_o)
                     h = self._norm(st, x, L.ln2).view(b, -1)
                     x = x + F.linear(self._act(st, F.linear(h, L.w_gu)), L.w_down)
                     break
-                a = F.scaled_dot_product_attention(
-                    q.contiguous(), _repeat_kv(kc[:, :, :S]), _repeat_kv(vc[:, :, :S]),
-                    is_causal=True, scale=HEAD_DIM ** -0.5)
+                a = self._sdpa_causal(st, q, kc[:, :, :S], vc[:, :, :S])
                 x = x + F.linear(a.transpose(1, 2).reshape(M, Q_SIZE), L.w_o)
                 h = self._norm(st, x, L.ln2).view(M, -1)
                 x = x + F.linear(self._act(st, F.linear(h, L.w_gu)), L.w_down)
@@ -330,6 +476,8 @@ class Engine:
 
     def _decode(self, st, host_pos=None):
         """One token per sequence at st.pos (device) or host_pos (eager T1); advances st.pos."""
+        if st.fast:
+            return self._decode_fast(st)
         if st.gemv:
             return self._decode_gemv(st)
         B = st.B
@@ -377,7 +525,7 @@ class Engine:
 
     # ------------------------------------------------------------------ shapes, graphs
     def _build(self, B, S, N, tier):
-        if tier == 4 and B > GEMV_MAX_B:
+        if tier in (4, 5) and B > GEMV_MAX_B:
             tier = 3
         self.state = None
         gc.collect()
@@ -614,7 +762,10 @@ class Engine:
         if FORCE_TIER >= 0:
             order = [FORCE_TIER] if FORCE_TIER > 0 else []
         elif _KERNEL_ERR is None and CUDA:
-            order = ([4] if _GEMV_ERR is None and _FUSED_ERR is None and B <= GEMV_MAX_B else [])                 + ([3] if _FUSED_ERR is None else []) + [2, 1]
+            small = B <= GEMV_MAX_B and _FUSED_ERR is None
+            order = ([5] if small and _FAST_ERR is None else []) \
+                + ([4] if small and _GEMV_ERR is None else []) \
+                + ([3] if _FUSED_ERR is None else []) + [2, 1]
         else:
             order = [1]
         passing = []                       # (wall ms for K tokens, tier, per-step GPU timings)

@@ -26,8 +26,10 @@ def _rms_norm_rows_kernel(x_ptr, w_ptr, y_ptr, outer_stride, heads, n_cols, eps,
     # Cast placement: the reference ends ``self.weight * hidden_states.to(input_dtype)``, so
     # the normalised value is rounded to BF16 *before* the weight multiply. Keeping the
     # product in fp32 is a different function and can move a logit past the tie margin.
-    weight = tl.load(w_ptr + cols, mask=mask, other=0.0)
-    tl.store(y_ptr + row * n_cols + cols, normed.to(y_ptr.dtype.element_ty) * weight, mask=mask)
+    # BF16 x BF16 is computed as the exact fp32 product rounded once to BF16 (as torch does).
+    weight = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = normed.to(tl.bfloat16).to(tl.float32) * weight
+    tl.store(y_ptr + row * n_cols + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
 def rms_norm_rows(x: torch.Tensor, weight: torch.Tensor, eps: float, heads: int = 1,
