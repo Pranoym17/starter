@@ -60,6 +60,12 @@ try:
     _MEGA_ERR = None
 except Exception as _exc:
     _MEGA_ERR = repr(_exc)[:200]
+try:
+    from kernels import tree as _tree
+    from spec import SeqDraft, Tree
+    _TREE_ERR = None
+except Exception as _exc:
+    _TREE_ERR = repr(_exc)[:200]
 
 DEVICE = os.environ.get("ENGINE_DEVICE", "cuda:0")
 CUDA = DEVICE.startswith("cuda")
@@ -77,6 +83,9 @@ SPEC_MAX_ROWS = 64        # verify runs B*(k+1) rows through the skinny GEMMs
 SPEC_CHECK_TOKENS = 128   # warmup tokens used to validate and time speculative decoding
 SPEC_MIN_GAIN = 0.92      # keep spec only if its warmup wall time is below this fraction of plain
 WARMUP_SOFT_S = 170.0     # past this many seconds since load start, skip optional warmup work
+SPEC_TREE = os.environ.get("ENGINE_TREE", "1") != "0"   # exact token-tree speculation (T5/T6)
+TREE_CHECK_TOKENS = 128   # warmup tokens used to validate and time tree speculation
+TREE_MIN_GAIN = 0.92      # keep it only if its warmup wall time is below this fraction of plain
 
 GEMV_MAX_B = 64          # T4's skinny-GEMM decode path covers batches up to this
 
@@ -153,7 +162,13 @@ class _State:
         self.spec_T = T if (self.gemv and SPEC and N > 1 and B * T <= SPEC_MAX_ROWS
                             and time.perf_counter() - eng.t_load0 < WARMUP_SOFT_S - 60) else 0
         self.spec = False
-        cap = self.capacity = S + N + self.spec_T
+        Tt = 16 if B == 1 else 8
+        self.tree_T = Tt if ((self.fast or self.mega) and SPEC_TREE and _TREE_ERR is None and N > 1
+                             and B * Tt <= SPEC_MAX_ROWS
+                             and time.perf_counter() - eng.t_load0 < WARMUP_SOFT_S - 60) else 0
+        self.tree_on = False
+        self.tree_graph = None
+        cap = self.capacity = S + N + self.spec_T + self.tree_T
         n_layers = len(eng.layers)
         # one stacked cache per K/V (layer-major) so the persistent kernel can index layers
         self.k_all = torch.zeros((n_layers, B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE)
@@ -189,6 +204,12 @@ class _State:
             self.qkv_buf = torch.empty((B, eng.w_qkv_all.shape[1]), dtype=BF16, device=DEVICE)
             self.act_buf = torch.empty((B, I), dtype=BF16, device=DEVICE)
             self.megastep = MegaStep(eng, self)
+        if self.tree_T:
+            try:
+                eng._tree_setup(self)
+            except Exception as exc:                    # speculation is optional: never the tier
+                log(f"tree speculation disabled at setup: {repr(exc)[:160]}")
+                self.tree_T = 0
         if self.spec_T:
             T = self.spec_T
             self.vplans, self.v_qkv, self.v_act = eng._make_plans(B * T)
@@ -327,41 +348,39 @@ class Engine:
         st.pos.add_(1)
 
     # ------------------------------------------------------------------ T5
-    def _fast_plans(self, st):
-        """T5 kernels for batch B; configs (tile, warps, stages, split-K) tuned once per B by timing."""
-        B, H, I, V = st.B, self.embed.shape[1], self.inter, self.lm_head.shape[0]
+    def _fast_gemms(self, M):
+        """T5 GEMM set + LM head for M rows; configs (tile, warps, stages, split-K) tuned once per M."""
+        H, I, V = self.embed.shape[1], self.inter, self.lm_head.shape[0]
         L = self.layers[0]
-        st.x = torch.empty((B, H), dtype=BF16, device=DEVICE)
-        st.ss = torch.zeros((2 * len(self.layers) + 1, B), dtype=torch.float32, device=DEVICE)
-        st.qkv_buf = torch.empty((B, L.w_qkv.shape[0]), dtype=BF16, device=DEVICE)
-        st.act_buf = torch.empty((B, I), dtype=BF16, device=DEVICE)
         fg = {
-            "qkv": _fast.FastGemm(B, L.w_qkv.shape[0], H, _fast.EPI_NONE, DEVICE, norm=True),
-            "o": _fast.FastGemm(B, H, L.w_o.shape[1], _fast.EPI_RES, DEVICE, ss_out=True),
-            "gu": _fast.FastGemm(B, I, H, _fast.EPI_SILU, DEVICE, norm=True),
-            "down": _fast.FastGemm(B, H, I, _fast.EPI_RES, DEVICE, ss_out=True),
+            "qkv": _fast.FastGemm(M, L.w_qkv.shape[0], H, _fast.EPI_NONE, DEVICE, norm=True),
+            "o": _fast.FastGemm(M, H, L.w_o.shape[1], _fast.EPI_RES, DEVICE, ss_out=True),
+            "gu": _fast.FastGemm(M, I, H, _fast.EPI_SILU, DEVICE, norm=True),
+            "down": _fast.FastGemm(M, H, I, _fast.EPI_RES, DEVICE, ss_out=True),
         }
         for g in fg.values():
             g.eps = self.eps
-        lm = _fast.FastLmHead(B, V, H, DEVICE)
+        lm = _fast.FastLmHead(M, V, H, DEVICE)
         lm.eps = self.eps
-        cached = self._tuned_fast.get(B)
+        cached = self._tuned_fast.get(M)
         if cached is None:
             cached = {k: g.cfg for k, g in fg.items()}
             cached["lm"] = lm.cfg
             if CUDA and time.perf_counter() - self.t_load0 < WARMUP_SOFT_S - 60:
                 t0 = time.perf_counter()
                 gen = torch.Generator(device=DEVICE).manual_seed(0)
-                rnd = lambda n: torch.randn((B, n), generator=gen, device=DEVICE).to(BF16)  # noqa: E731
-                ss = torch.full((B,), float(H), dtype=torch.float32, device=DEVICE)
-                ss_out = torch.zeros((B,), dtype=torch.float32, device=DEVICE)
-                scratch = torch.zeros((B, H), dtype=BF16, device=DEVICE)
-                tok = torch.zeros((B,), dtype=torch.int64, device=DEVICE)
+                rnd = lambda n: torch.randn((M, n), generator=gen, device=DEVICE).to(BF16)  # noqa: E731
+                ss = torch.full((M,), float(H), dtype=torch.float32, device=DEVICE)
+                ss_out = torch.zeros((M,), dtype=torch.float32, device=DEVICE)
+                scratch = torch.zeros((M, H), dtype=BF16, device=DEVICE)
+                qkv_o = torch.empty((M, L.w_qkv.shape[0]), dtype=BF16, device=DEVICE)
+                act_o = torch.empty((M, I), dtype=BF16, device=DEVICE)
+                tok = torch.zeros((M,), dtype=torch.int64, device=DEVICE)
                 posb = torch.zeros((1,), dtype=torch.int64, device=DEVICE)
                 jobs = {
-                    "qkv": lambda g: g(rnd(H), L.w_qkv, st.qkv_buf, norm_w=L.ln1, ss_in=ss),
+                    "qkv": lambda g: g(rnd(H), L.w_qkv, qkv_o, norm_w=L.ln1, ss_in=ss),
                     "o": lambda g: g(rnd(L.w_o.shape[1]), L.w_o, scratch, res=scratch, ss_out=ss_out),
-                    "gu": lambda g: g(rnd(H), L.w_gu, st.act_buf, norm_w=L.ln2, ss_in=ss),
+                    "gu": lambda g: g(rnd(H), L.w_gu, act_o, norm_w=L.ln2, ss_in=ss),
                     "down": lambda g: g(rnd(I), L.w_down, scratch, res=scratch, ss_out=ss_out),
                 }
                 desc = []
@@ -374,13 +393,68 @@ class Engine:
                                        lambda m: m(xl, self.lm_head, tok, self.final_norm, ss, posb, False))
                 cached["lm"] = cfg
                 desc.append(f"lm={cfg[0]}x{cfg[1]}:{t * 1e3:.0f}us")
-                log(f"T5 tuned B={B} in {time.perf_counter() - t0:.1f}s: {' '.join(desc)}")
-            self._tuned_fast[B] = cached
+                log(f"fast GEMMs tuned M={M} in {time.perf_counter() - t0:.1f}s: {' '.join(desc)}")
+            self._tuned_fast[M] = cached
         for k, g in fg.items():
             g.set_config(cached[k])
         lm.set_config(cached["lm"])
-        st.fg, st.flm = fg, lm
+        return fg, lm
+
+    def _fast_plans(self, st):
+        """T5 buffers and kernels for batch B."""
+        B, H, I = st.B, self.embed.shape[1], self.inter
+        L = self.layers[0]
+        st.x = torch.empty((B, H), dtype=BF16, device=DEVICE)
+        st.ss = torch.zeros((2 * len(self.layers) + 1, B), dtype=torch.float32, device=DEVICE)
+        st.qkv_buf = torch.empty((B, L.w_qkv.shape[0]), dtype=BF16, device=DEVICE)
+        st.act_buf = torch.empty((B, I), dtype=BF16, device=DEVICE)
+        st.fg, st.flm = self._fast_gemms(B)
         st.fattn = _fast.FastAttention(B, N_KV, st.capacity, DEVICE, self.sm_count)
+
+    def _tree_setup(self, st):
+        """Buffers and kernels for token-tree verification of T nodes per sequence (M = B*T rows)."""
+        from types import SimpleNamespace
+        B, T = st.B, st.tree_T
+        M, H, I = B * T, self.embed.shape[1], self.inter
+        L = self.layers[0]
+        tr = SimpleNamespace()
+        tr.fg, tr.lm = self._fast_gemms(M)
+        tr.attn = _tree.TreeAttention(B, T, N_KV, st.capacity, DEVICE, self.sm_count)
+        i64, i32 = torch.int64, torch.int32
+        dev = lambda shape, dt: torch.zeros(shape, dtype=dt, device=DEVICE)  # noqa: E731
+        pin = lambda shape, dt: torch.zeros(shape, dtype=dt, pin_memory=CUDA)  # noqa: E731
+        tr.tok, tr.depth, tr.base, tr.anc = dev((B, T), i64), dev((M,), i64), dev((B,), i64), dev((B, T), i32)
+        tr.c_base, tr.c_src, tr.c_cnt = dev((B,), i64), dev((B, T), i32), dev((B,), i32)
+        tr.tok_h, tr.depth_h, tr.base_h, tr.anc_h = pin((B, T), i64), pin((M,), i64), pin((B,), i64), pin((B, T), i32)
+        tr.c_base_h, tr.c_src_h, tr.c_cnt_h = pin((B,), i64), pin((B, T), i32), pin((B,), i32)
+        tr.out, tr.out_h = dev((M,), i64), pin((M,), i64)
+        tr.x = torch.empty((M, H), dtype=BF16, device=DEVICE)
+        tr.ss = dev((2 * len(self.layers) + 1, M), torch.float32)
+        tr.qkv = torch.empty((M, L.w_qkv.shape[0]), dtype=BF16, device=DEVICE)
+        tr.q = torch.empty((B, T, N_HEADS, HEAD_DIM), dtype=BF16, device=DEVICE)
+        tr.attn_out = torch.empty((B, T, N_HEADS, HEAD_DIM), dtype=BF16, device=DEVICE)
+        tr.act = torch.empty((M, I), dtype=BF16, device=DEVICE)
+        tr.dpos = dev((1,), i64)
+        tr.event = _event()
+        st.tr = tr
+
+    def _verify_tree(self, st):
+        """One tree-verification forward (graph-capturable): apply the previous acceptance's KV
+        compaction, then run the B*T tree nodes through the model; st.tr.out = argmax per node."""
+        tr, B, T = st.tr, st.B, st.tree_T
+        M = B * T
+        g = tr.fg
+        _tree.compact(st.k_all, st.v_all, tr.c_base, tr.c_src, tr.c_cnt, T)
+        _fast.embed_ss(tr.tok.view(-1), self.embed, tr.x, tr.ss)
+        for i, L in enumerate(self.layers):
+            kc, vc = st.k_cache[i], st.v_cache[i]
+            qkv = g["qkv"](tr.x, L.w_qkv, tr.qkv, norm_w=L.ln1, ss_in=tr.ss[2 * i])
+            _tree.tree_qk(qkv, L.q_norm, L.k_norm, st.cos, st.sin, tr.base, tr.depth, tr.q, kc, vc, B, T, self.eps)
+            a = tr.attn(tr.q, kc, vc, tr.base, tr.anc, tr.attn_out)
+            g["o"](a.view(M, Q_SIZE), L.w_o, tr.x, res=tr.x, ss_out=tr.ss[2 * i + 1])
+            act = g["gu"](tr.x, L.w_gu, tr.act, norm_w=L.ln2, ss_in=tr.ss[2 * i + 1])
+            g["down"](act, L.w_down, tr.x, res=tr.x, ss_out=tr.ss[2 * i + 2])
+        tr.lm(tr.x, self.lm_head, tr.out, self.final_norm, tr.ss[2 * len(self.layers)], tr.dpos, False)
 
     def _decode_fast(self, st):
         """T5 decode step: 1 + 5 per layer + 1 launches. Norm statistics live in st.ss:
@@ -589,6 +663,17 @@ class Engine:
                             self._verify(st)
                 torch.cuda.current_stream().wait_stream(side)
                 torch.cuda.synchronize()
+                if st.tree_T:
+                    try:
+                        with torch.cuda.stream(side):
+                            for _ in range(2):
+                                st.tr.base.fill_(S)
+                                self._verify_tree(st)
+                        torch.cuda.current_stream().wait_stream(side)
+                        torch.cuda.synchronize()
+                    except Exception as exc:
+                        log(f"tree speculation disabled at warmup: {repr(exc)[:160]}")
+                        st.tree_T = 0
                 st.compile_s = time.perf_counter() - t0
                 t0 = time.perf_counter()
                 try:
@@ -607,6 +692,15 @@ class Engine:
                         with torch.cuda.graph(g):
                             self._verify(st)
                         st.verify_graph = g
+                    if st.tree_T:
+                        try:
+                            g = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(g):
+                                self._verify_tree(st)
+                            st.tree_graph = g
+                        except Exception as exc:
+                            log(f"tree speculation disabled at capture: {repr(exc)[:160]}")
+                            st.tree_T, st.tree_graph = 0, None
                 except Exception as exc:
                     log(f"graph capture failed, T{tier} runs eager: {repr(exc)[:160]}")
                     st.prefill_graph = st.decode_graph = st.verify_graph = None
@@ -726,6 +820,103 @@ class Engine:
             while yielded < N and all(len(sq) - S > yielded for sq in seqs):
                 yield [sq[S + yielded] for sq in seqs]
                 yielded += 1
+
+    def _stream_tree(self, st, input_ids, N):
+        """Exact token-tree speculative decoding (NOTES.md, Phase 4 v2). Yields exactly N steps."""
+        tr, B, S, T = st.tr, st.B, st.S, st.tree_T
+        maxd = min(T - 1, 8)
+        with torch.inference_mode():
+            st.ids_host.copy_(torch.tensor(input_ids, dtype=torch.int64))
+            st.ids.copy_(st.ids_host, non_blocking=True)
+            st.pos.fill_(S)
+            if st.prefill_graph is not None:
+                st.prefill_graph.replay()
+            else:
+                st.prefill_logits = self._prefill(st)
+            st.host[0].copy_(st.tok, non_blocking=True)
+            st.events[0].record()
+        st.events[0].synchronize()
+        first = st.host[0].tolist()
+        yield first
+        if N == 1:
+            return
+        seqs = [list(p) + [t] for p, t in zip(input_ids, first)]
+        drafts = [SeqDraft(sq) for sq in seqs]
+        c_base, c_src, c_cnt = [S] * B, [[0] * T for _ in range(B)], [1] * B
+        yielded = 1
+        while yielded < N:
+            trees, toks, depths, bases, ancs = [], [], [], [], []
+            for b in range(B):
+                sq = seqs[b]
+                if len(sq) - S >= N:                           # done: frozen at a safe slot
+                    tree = Tree(sq[-1], T)
+                    tree.pad(T)
+                    trees.append(None)
+                    bases.append(S)
+                else:
+                    tree = drafts[b].build(T, maxd)
+                    trees.append(tree)
+                    bases.append(len(sq) - 1)
+                toks.append(tree.tokens)
+                depths.extend(tree.depth)
+                ancs.append([a - (1 << 32) if a >= 1 << 31 else a for a in tree.anc])
+            tr.tok_h.copy_(torch.tensor(toks, dtype=torch.int64))
+            tr.depth_h.copy_(torch.tensor(depths, dtype=torch.int64))
+            tr.base_h.copy_(torch.tensor(bases, dtype=torch.int64))
+            tr.anc_h.copy_(torch.tensor(ancs, dtype=torch.int32))
+            tr.c_base_h.copy_(torch.tensor(c_base, dtype=torch.int64))
+            tr.c_src_h.copy_(torch.tensor(c_src, dtype=torch.int32))
+            tr.c_cnt_h.copy_(torch.tensor(c_cnt, dtype=torch.int32))
+            with torch.inference_mode():
+                for d, h in ((tr.tok, tr.tok_h), (tr.depth, tr.depth_h), (tr.base, tr.base_h), (tr.anc, tr.anc_h),
+                             (tr.c_base, tr.c_base_h), (tr.c_src, tr.c_src_h), (tr.c_cnt, tr.c_cnt_h)):
+                    d.copy_(h, non_blocking=True)
+                if st.tree_graph is not None:
+                    st.tree_graph.replay()
+                else:
+                    self._verify_tree(st)
+                tr.out_h.copy_(tr.out, non_blocking=True)
+                tr.event.record()
+            tr.event.synchronize()
+            g = tr.out_h.tolist()
+            for b in range(B):
+                tree = trees[b]
+                if tree is None:
+                    c_cnt[b] = 1
+                    continue
+                emitted, path = drafts[b].update(tree, g[b * T:(b + 1) * T])
+                c_base[b] = bases[b]
+                c_src[b] = [0] + path + [0] * (T - 1 - len(path))
+                c_cnt[b] = len(path) + 1
+                seqs[b].extend(emitted)
+                drafts[b].register()
+            while yielded < N and all(len(sq) - S > yielded for sq in seqs):
+                yield [sq[S + yielded] for sq in seqs]
+                yielded += 1
+
+    def _decide_tree(self, st, input_ids, N):
+        """Warmup-only: validate tree speculation on this prompt; keep it only if exact
+        (teacher-forced margin <= MARGIN_LIMIT) and clearly faster than plain decode."""
+        n = min(N, TREE_CHECK_TOKENS)
+        try:
+            steps = list(self._stream_tree(st, input_ids, n))
+            assert len(steps) == n and all(len(x) == st.B for x in steps)
+            ours = [list(r) for r in zip(*steps)]
+            margin, nonarg, _ = self._teacher_force(input_ids, ours)
+            walls = []
+            for _ in range(2):
+                t0 = time.perf_counter()
+                for _ in self._stream_tree(st, input_ids, n):
+                    pass
+                walls.append((time.perf_counter() - t0) * 1e3)
+            tree_ms = min(walls)
+            plain_ms, _ = self._time_stream(st, input_ids, n)
+            st.tree_on = margin <= MARGIN_LIMIT and tree_ms < TREE_MIN_GAIN * plain_ms
+            log(f"tree spec T={st.tree_T}: margin={margin:.3f} non_argmax={nonarg} {n} tok: tree={tree_ms:.1f}ms "
+                f"plain={plain_ms:.1f}ms -> {'ON' if st.tree_on else 'off'}")
+        except Exception as exc:
+            st.tree_on = False
+            log(f"tree speculation disabled: {repr(exc)[:200]}")
 
     def _decide_spec(self, st, input_ids, N):
         """Warmup-only: validate speculative decoding on this prompt and keep it only if it is
@@ -855,6 +1046,9 @@ class Engine:
             if (self.state.spec_T and self.state.verify_graph is not None
                     and time.perf_counter() - self.t_load0 < WARMUP_SOFT_S):
                 self._decide_spec(self.state, input_ids, N)
+            if (self.state.tree_T and self.state.tree_graph is not None
+                    and time.perf_counter() - self.t_load0 < WARMUP_SOFT_S):
+                self._decide_tree(self.state, input_ids, N)
             # free the native model's unpacked copies; our tiers never touch them again
             self.hf = None
             gc.collect()
@@ -870,7 +1064,7 @@ class Engine:
             chosen = 0
         self.tier = chosen
         peak = torch.cuda.max_memory_reserved() / 1e9 if CUDA else 0.0
-        spec = self.state is not None and self.state.spec
+        spec = self.state is not None and (self.state.spec or self.state.tree_on)
         log(f"tier=T{chosen}{'+spec' if spec else ''} shape={B}x{S}x{N} check={check_s:.1f}s "
             f"warmup={time.perf_counter() - t_start:.1f}s load={self.load_s:.1f}s peak={peak:.1f}GB")
 
@@ -907,7 +1101,9 @@ class Engine:
                 for step, _ in self._native(input_ids, N):
                     yield step
                 return
-            if st.spec:
+            if st.tree_on:
+                yield from self._stream_tree(st, input_ids, N)
+            elif st.spec:
                 yield from self._stream_spec(st, input_ids, N)
             else:
                 yield from self._stream(st, input_ids, N)

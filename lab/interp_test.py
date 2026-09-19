@@ -334,6 +334,73 @@ def test_fast_lm_head():
             assert int(pos) == 42 and int(lm.ticket) == 0
 
 
+# ------------------------------------------------------------------ tree speculation kernels
+def _random_tree(T, rng):
+    parent = [-1] + [rng.randrange(0, i) for i in range(1, T)]
+    depth, anc = [0] * T, [1] * T
+    for i in range(1, T):
+        depth[i] = depth[parent[i]] + 1
+        anc[i] = anc[parent[i]] | (1 << i)
+    return parent, depth, anc
+
+
+def test_tree_kernels():
+    from kernels import tree
+    rng = random.Random(7)
+    cap = 160
+    cos, sin = rope_tables(cap)
+    qn, kn = (torch.rand(D) + 0.5).to(BF16), (torch.rand(D) + 0.5).to(BF16)
+    for B, T, bases, sm in ((1, 16, [40], 132), (2, 8, [3, 100], 132), (2, 8, [70, 120], 5)):
+        depth = torch.zeros(B, T, dtype=torch.int64)
+        anc = torch.zeros(B, T, dtype=torch.int32)
+        for b in range(B):
+            _, dp, an = _random_tree(T, rng)
+            depth[b] = torch.tensor(dp)
+            anc[b] = torch.tensor([a - (1 << 32) if a >= 1 << 31 else a for a in an], dtype=torch.int32)
+        base = torch.tensor(bases)
+        qkv = (torch.randn(B * T, 6144) * 2).to(BF16)
+        kc = torch.randn(B, NKV, cap, D).to(BF16)
+        vc = torch.randn(B, NKV, cap, D).to(BF16)
+        q = torch.empty(B, T, NQ, D, dtype=BF16)
+        tree.tree_qk(qkv, qn, kn, cos, sin, base, depth.view(-1), q, kc, vc, B, T, EPS)
+        positions = base[:, None] + depth
+        q_ref, k_ref, v_ref = _qk_ref(qkv, qn, kn, cos, sin, positions, B, T)
+        close(q, q_ref, "tree q")
+        for b in range(B):
+            for t in range(T):
+                close(kc[b, :, bases[b] + t], k_ref[b, t], "tree k slot")
+                close(vc[b, :, bases[b] + t], v_ref[b, t], "tree v slot", ulps=0)
+        out = torch.empty(B, T, NQ, D, dtype=BF16)
+        att = tree.TreeAttention(B, T, NKV, cap, "cpu", sm)
+        att(q, kc, vc, base, anc, out)
+        assert torch.isfinite(out.float()).all()
+        for b in range(B):
+            for t in range(T):
+                vis = list(range(bases[b])) + [bases[b] + j for j in range(T) if (int(anc[b, t]) >> j) & 1]
+                for h in range(0, NQ, 5):
+                    g = h // 4
+                    k = kc[b, g, vis].float()
+                    v = vc[b, g, vis].float()
+                    p = torch.softmax((q[b, t, h].float() @ k.T) / math.sqrt(D), -1)
+                    close(out[b, t, h], p @ v, f"tree attn B={B} T={T} splits={att.splits}", atol=2e-2, ulps=4)
+    # compaction: accepted path nodes move from scratch slots to consecutive positions
+    L, B, T = 2, 2, 8
+    k_all = torch.randn(L, B, NKV, 60, D).to(BF16)
+    v_all = torch.randn(L, B, NKV, 60, D).to(BF16)
+    k0, v0 = k_all.clone(), v_all.clone()
+    base = torch.tensor([10, 30])
+    src = torch.zeros(B, T, dtype=torch.int32)
+    src[0, 1:4] = torch.tensor([2, 5, 7])
+    src[1, 1:2] = torch.tensor([1])
+    cnt = torch.tensor([4, 2], dtype=torch.int32)
+    tree.compact(k_all, v_all, base, src, cnt, T)
+    for l in range(L):
+        for k, s in ((1, 2), (2, 5), (3, 7)):
+            assert torch.equal(k_all[l, 0, :, 10 + k], k0[l, 0, :, 10 + s]), "compaction k"
+            assert torch.equal(v_all[l, 0, :, 10 + k], v0[l, 0, :, 10 + s]), "compaction v"
+        assert torch.equal(k_all[l, 1], k0[l, 1]), "compaction touched a no-op sequence"
+
+
 # ------------------------------------------------------------------ end to end (tiny model)
 def _tiny_model(path):
     from transformers import Qwen3Config, Qwen3ForCausalLM
@@ -368,13 +435,14 @@ def test_end_to_end_t4_and_spec():
     spec.loader.exec_module(mod)
     with tempfile.TemporaryDirectory() as d:
         ref_model = _tiny_model(d)
+        mod.WARMUP_SOFT_S = 1e9                  # the interpreter is slow; keep optional features on
         eng = mod.Engine(d)
         rng = random.Random(3)
         for B, S, N in ((1, 21, 9), (3, 16, 7)):
             prompts = [[rng.randrange(1000) for _ in range(S)] for _ in range(B)]
             want = _native(ref_model, prompts, N)
             # pre-seed tuned configs so no CUDA timing is needed
-            for M in {B, B * 5, B * 7}:
+            for M in {B, B * 5, B * 7, B * 8, B * 16}:
                 eng._tuned[M] = {"qkv": (32, 128, 4, 4), "o": (32, 128, 4, 4), "gu": (32, 128, 4, 4),
                                  "down": (16, 256, 4, 3), "lm": (64, 128, 4, 4)}
             for tier in (6, 5, 4, 3, 2):
@@ -393,6 +461,14 @@ def test_end_to_end_t4_and_spec():
                 same = sum(a == b for x, y in zip(got, want) for a, b in zip(x, y))
                 print(f"    T{tier} B={B} S={S} N={N}: {same}/{B * N} tokens equal native")
                 assert same >= 0.9 * B * N, f"T{tier} diverges from native"
+                if st.tree_T:
+                    st.tree_graph = None             # eager verify through the real tree kernels
+                    with torch.inference_mode():
+                        sp = list(mod.Engine._stream_tree(eng, st, prompts, N))
+                    sgot = [list(r) for r in zip(*sp)]
+                    same = sum(a == b for x, y in zip(sgot, got) for a, b in zip(x, y))
+                    print(f"    T{tier}+tree(T={st.tree_T}) B={B}: {same}/{B * N} tokens equal plain T{tier}")
+                    assert same == B * N, "tree speculation diverges from plain decode"
                 if tier == 4 and st.spec_T:
                     st.verify_graph = SimpleNamespace(replay=lambda st=st: eng._verify(st))
                     with torch.inference_mode():
@@ -405,7 +481,7 @@ def test_end_to_end_t4_and_spec():
 
 TESTS = [test_rmsnorm, test_qk_norm_rope, test_silu_mul, test_decode_attention, test_verify_attention,
          test_gemv, test_lm_head, test_fast_embed_ss, test_fast_gemm, test_fast_attention, test_fast_lm_head,
-         test_end_to_end_t4_and_spec]
+         test_tree_kernels, test_end_to_end_t4_and_spec]
 
 
 def main():

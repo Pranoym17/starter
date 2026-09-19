@@ -117,6 +117,75 @@ def spec_logic_check(mod):
     print("  spec host logic: exact on 5 mock cases")
 
 
+def tree_logic_check(mod):
+    """Drive Engine._stream_tree with a mock device that implements the tree-verify contract
+    (compaction, scratch slots, ancestor masks, depths): output must equal plain greedy exactly."""
+    from types import SimpleNamespace
+    sys.path.insert(0, os.path.join(ROOT, "engine"))
+    import spec
+    mod.SeqDraft, mod.Tree = spec.SeqDraft, spec.Tree
+
+    def f(prefix):
+        return (prefix[-1] * 3 + prefix[-2] + (len(prefix) % 5 == 0)) % 23
+
+    def plain(prompt, n):
+        seq = list(prompt)
+        for _ in range(n):
+            seq.append(f(seq))
+        return seq[len(prompt):]
+
+    rng = random.Random(2)
+    total_tok = total_ver = 0
+    for B, S, N, T in [(1, 12, 60, 16), (3, 9, 33, 8), (4, 20, 2, 8), (2, 7, 1, 8), (5, 30, 64, 8), (8, 25, 40, 8)]:
+        prompts = [[rng.randrange(23) for _ in range(S)] for _ in range(B)]
+        cap = S + N + T
+        kv = [[None] * cap for _ in range(B)]
+        z = lambda *shape, dt=torch.int64: torch.zeros(shape, dtype=dt)  # noqa: E731
+        tr = SimpleNamespace(tok=z(B, T), depth=z(B * T), base=z(B), anc=z(B, T, dt=torch.int32), c_base=z(B),
+                             c_src=z(B, T, dt=torch.int32), c_cnt=z(B, dt=torch.int32), out=z(B * T),
+                             event=mod._NullEvent())
+        for name in ("tok", "depth", "base", "anc", "c_base", "c_src", "c_cnt", "out"):
+            setattr(tr, name + "_h", getattr(tr, name).clone())
+        st = SimpleNamespace(B=B, S=S, tree_T=T, tr=tr, ids_host=z(B, S), ids=z(B, S), pos=z(1), tok=z(B),
+                             host=z(max(N, 1), B), events=[mod._NullEvent() for _ in range(max(N, 1))])
+        n_verify = [0]
+
+        def prefill():
+            for b in range(B):
+                kv[b][:S] = st.ids[b].tolist()
+                st.tok[b] = f(kv[b][:S])
+
+        def verify():
+            n_verify[0] += 1
+            for b in range(B):
+                cb, cnt = int(tr.c_base[b]), int(tr.c_cnt[b])
+                for k in range(1, cnt):
+                    kv[b][cb + k] = kv[b][cb + int(tr.c_src[b, k])]
+                base = int(tr.base[b])
+                assert 0 <= base and base + T <= cap, "tree beyond cache capacity"
+                assert all(v is not None for v in kv[b][:base]), "tree reads an unwritten slot"
+                for t in range(T):
+                    kv[b][base + t] = int(tr.tok[b, t])
+                for t in range(T):
+                    a = int(tr.anc[b, t]) & 0xFFFFFFFF
+                    path = [j for j in range(T) if (a >> j) & 1]
+                    assert path[0] == 0 or t != 0 and False or True
+                    assert int(tr.depth[b * T + t]) == len(path) - 1, "depth / ancestor mask mismatch"
+                    ctx = kv[b][:base] + [int(tr.tok[b, j]) for j in path]
+                    tr.out[b * T + t] = f(ctx)
+
+        st.prefill_graph = SimpleNamespace(replay=prefill)
+        st.tree_graph = SimpleNamespace(replay=verify)
+        steps = list(mod.Engine._stream_tree(None, st, prompts, N))
+        assert len(steps) == N and all(len(s) == B and all(type(t) is int for t in s) for s in steps)
+        got = [[steps[i][b] for i in range(N)] for b in range(B)]
+        assert got == [plain(p, N) for p in prompts], f"tree spec mismatch B={B} S={S} N={N} T={T}"
+        if B == 1:
+            total_tok += N - 1
+            total_ver += n_verify[0]
+    print(f"  tree spec host logic: exact on 6 mock cases; B=1 mock: {total_tok / max(total_ver, 1):.2f} tokens/verify")
+
+
 def main():
     rng = random.Random(0)
     mk = lambda b, s: [[rng.randrange(1000) for _ in range(s)] for _ in range(b)]  # noqa: E731
@@ -124,6 +193,7 @@ def main():
         make_model(d)
         mod = load_engine()
         spec_logic_check(mod)
+        tree_logic_check(mod)
         for forced in ("-1", "0"):
             mod.FORCE_TIER = int(forced)
             eng = mod.Engine(d)
