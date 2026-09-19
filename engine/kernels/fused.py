@@ -8,7 +8,10 @@ PyTorch CUDA kernels these replace.
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+try:
+    from triton.language.extra import libdevice
+except ImportError:  # older layout
+    from triton.language.extra.cuda import libdevice
 
 
 @triton.jit

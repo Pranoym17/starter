@@ -7,8 +7,10 @@ position, and CUDA graphs over both prefill and the decode step. Arithmetic foll
 transformers 4.51.3 modeling_qwen3 operation by operation; only reduction order differs.
 
 Tiers, fastest first. On the first call of a shape (the platform's untimed warmup) the engine
-validates a tier against the loaded native model by teacher-forcing its own tokens, and falls
-back one tier on any exception, non-finite logit, or margin above MARGIN_LIMIT:
+validates tiers against the loaded native model by teacher-forcing their own tokens, falling
+back a tier on any exception, non-finite logit, or margin above MARGIN_LIMIT, and keeps the
+faster of the two best passing tiers:
+  T4  T3 + Triton skinny-GEMM decode (fused residual / SwiGLU epilogues, LM head + argmax)
   T3  CUDA graphs + fused Triton kernels
   T2  CUDA graphs + Triton norm / decode attention, torch elementwise ops
   T1  eager, torch ops only (reference-style SDPA over the cache)
@@ -37,6 +39,11 @@ try:
     _FUSED_ERR = None
 except Exception as _exc:
     _FUSED_ERR = repr(_exc)[:200]
+try:
+    from kernels.gemv import EPI_NONE, EPI_RES, EPI_SILU, Gemv, LmHeadArgmax
+    _GEMV_ERR = None
+except Exception as _exc:
+    _GEMV_ERR = repr(_exc)[:200]
 
 DEVICE = os.environ.get("ENGINE_DEVICE", "cuda:0")
 CUDA = DEVICE.startswith("cuda")
@@ -50,8 +57,11 @@ MARGIN_LIMIT = 1.0        # native's own drift is <= 0.75; the judge's margin is
 PREFILL_TOKENS = 16384    # prefill processes at most this many tokens per row-chunk
 FORCE_TIER = int(os.environ.get("ENGINE_TIER", "-1"))
 
-#            graphs  triton  fused
-TIERS = {3: (True, True, True), 2: (True, True, False), 1: (False, False, False)}
+GEMV_MAX_B = 64          # T4's skinny-GEMM decode path covers batches up to this
+
+#            graphs  triton  fused  gemv
+TIERS = {4: (True, True, True, True), 3: (True, True, True, False),
+         2: (True, True, False, False), 1: (False, False, False, False)}
 
 
 def log(msg):
@@ -89,7 +99,7 @@ class _State:
 
     def __init__(self, eng, B, S, N, tier):
         self.B, self.S, self.N, self.tier = B, S, N, tier
-        self.graphs, self.triton, self.fused = TIERS[tier]
+        self.graphs, self.triton, self.fused, self.gemv = TIERS[tier]
         cap = S + N
         n_layers = len(eng.layers)
         self.k_cache = [torch.zeros((B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE) for _ in range(n_layers)]
@@ -111,6 +121,8 @@ class _State:
         self.prefill_graph = self.decode_graph = None
         self.prefill_logits = None
         self.compile_s = self.capture_s = 0.0
+        if self.gemv:
+            eng._gemv_plans(self)
 
 
 class Engine:
@@ -147,9 +159,69 @@ class Engine:
         self.sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count if CUDA else 1
         self.state = None
         self.tier = None
+        self._tuned = {}
         self.load_s = time.perf_counter() - t0
         log(f"loaded in {self.load_s:.1f}s; kernels {'ok' if _KERNEL_ERR is None else 'UNAVAILABLE ' + _KERNEL_ERR}; "
             f"fused {'ok' if _FUSED_ERR is None else 'UNAVAILABLE ' + _FUSED_ERR}")
+
+    def _gemv_plans(self, st):
+        """T4: skinny-GEMM plans for batch B, tuned once per B (compiles every config it keeps)."""
+        B, H, I = st.B, self.embed.shape[1], self.inter
+        L = self.layers[0]
+        st.qkv_buf = torch.empty((B, L.w_qkv.shape[0]), dtype=BF16, device=DEVICE)
+        st.act_buf = torch.empty((B, I), dtype=BF16, device=DEVICE)
+        cached = self._tuned.get(B)
+        plans = {
+            "qkv": Gemv(B, L.w_qkv.shape[0], H, EPI_NONE, DEVICE, self.sm_count),
+            "o": Gemv(B, H, L.w_o.shape[1], EPI_RES, DEVICE, self.sm_count),
+            "gu": Gemv(B, I, H, EPI_SILU, DEVICE, self.sm_count),
+            "down": Gemv(B, H, I, EPI_RES, DEVICE, self.sm_count),
+        }
+        lm = LmHeadArgmax(B, self.lm_head.shape[0], H, DEVICE)
+        if cached is None:
+            t0 = time.perf_counter()
+            g = torch.Generator(device=DEVICE).manual_seed(0)
+            xs = {k: torch.randn((B, n), generator=g, device=DEVICE).to(BF16) for k, n in
+                  (("qkv", H), ("o", L.w_o.shape[1]), ("gu", H), ("down", I))}
+            ws = {"qkv": L.w_qkv, "o": L.w_o, "gu": L.w_gu, "down": L.w_down}
+            outs = {"qkv": st.qkv_buf, "o": torch.empty((B, H), dtype=BF16, device=DEVICE),
+                    "gu": st.act_buf, "down": torch.empty((B, H), dtype=BF16, device=DEVICE)}
+            res = torch.zeros((B, H), dtype=BF16, device=DEVICE)
+            cached, desc = {}, []
+            for k, plan in plans.items():
+                t, cfg = plan.tune(xs[k], ws[k], outs[k], res if plan.epi == EPI_RES else None)
+                cached[k] = cfg
+                desc.append(f"{k}={cfg[0]}x{cfg[1]}/w{cfg[2]}s{cfg[3]}k{plan.split}:{t * 1e3:.0f}us")
+            tok = torch.empty((B,), dtype=torch.int64, device=DEVICE)
+            t, cfg = lm.tune(xs["qkv"], self.lm_head, tok)
+            cached["lm"] = cfg
+            desc.append(f"lm={cfg[0]}x{cfg[1]}:{t * 1e3:.0f}us")
+            self._tuned[B] = cached
+            log(f"gemv tuned B={B} in {time.perf_counter() - t0:.1f}s: {' '.join(desc)}")
+        for k, plan in plans.items():
+            plan.set_config(cached[k])
+        lm.set_config(cached["lm"])
+        st.plans, st.lm = plans, lm
+
+    def _decode_gemv(self, st):
+        """T4 decode step: Triton skinny GEMMs with fused epilogues; residual stream updated in place."""
+        B = st.B
+        p = st.plans
+        x = F.embedding(st.tok, self.embed)
+        for i, L in enumerate(self.layers):
+            kc, vc = st.k_cache[i], st.v_cache[i]
+            h = rms_norm_rows(x, L.ln1, self.eps).view(B, -1)
+            qkv = p["qkv"](h, L.w_qkv, st.qkv_buf)
+            qk_norm_rope_cache(qkv, L.q_norm, L.k_norm, st.cos, st.sin, st.pos, st.q_buf, kc, vc,
+                               B, 1, self.eps, True)
+            a = st.attn(st.q_buf.view(B, N_HEADS, HEAD_DIM), kc, vc, st.pos, st.attn_out)
+            p["o"](a.view(B, Q_SIZE), L.w_o, x, res=x)
+            h = rms_norm_rows(x, L.ln2, self.eps).view(B, -1)
+            act = p["gu"](h, L.w_gu, st.act_buf)
+            p["down"](act, L.w_down, x, res=x)
+        h = rms_norm_rows(x, self.final_norm, self.eps).view(B, -1)
+        st.lm(h, self.lm_head, st.tok)
+        st.pos.add_(1)
 
     # ------------------------------------------------------------------ building blocks
     def _norm(self, st, x2d, w, heads=1):
@@ -207,6 +279,8 @@ class Engine:
 
     def _decode(self, st, host_pos=None):
         """One token per sequence at st.pos (device) or host_pos (eager T1); advances st.pos."""
+        if st.gemv:
+            return self._decode_gemv(st)
         B = st.B
         x = F.embedding(st.tok, self.embed)
         if host_pos is None:
@@ -252,6 +326,8 @@ class Engine:
 
     # ------------------------------------------------------------------ shapes, graphs
     def _build(self, B, S, N, tier):
+        if tier == 4 and B > GEMV_MAX_B:
+            tier = 3
         self.state = None
         gc.collect()
         if CUDA:
@@ -368,7 +444,8 @@ class Engine:
         return worst, nonarg, first
 
     def _select_tier(self, input_ids, N):
-        """Warmup-only: validate tiers best-first on this prompt, keep the first that passes."""
+        """Warmup-only: validate tiers best-first on this prompt; keep the faster of the first two
+        that pass (a new kernel tier can never make the engine wrong, nor slower than the next one)."""
         t_start = time.perf_counter()
         B, S = len(input_ids), len(input_ids[0])
         K = min(N, CHECK_STEPS)
@@ -381,10 +458,12 @@ class Engine:
         native_toks = [list(r) for r in zip(*native_toks)]
         if FORCE_TIER >= 0:
             order = [FORCE_TIER] if FORCE_TIER > 0 else []
+        elif _KERNEL_ERR is None and CUDA:
+            order = ([4] if _GEMV_ERR is None and _FUSED_ERR is None and B <= GEMV_MAX_B else [])                 + ([3] if _FUSED_ERR is None else []) + [2, 1]
         else:
-            order = ([3] if _FUSED_ERR is None else []) + [2, 1] if (_KERNEL_ERR is None and CUDA) else [1]
-        chosen = 0
-        for tier in order:
+            order = [1]
+        passing = []                       # (wall ms for K tokens, tier, per-step GPU timings)
+        for n, tier in enumerate(order):
             try:
                 st = self._build(B, S, N, tier)
                 steps = list(self._stream(st, input_ids, K))
@@ -398,24 +477,25 @@ class Engine:
                     f"first_diverge_vs_native={div} prefill_logit_maxdiff={dlog:.3f} finite={finite} "
                     f"compile={st.compile_s:.1f}s capture={st.capture_s:.1f}s")
                 if finite and margin <= MARGIN_LIMIT:
-                    chosen = tier
-                    break
+                    wall, timing = self._time_stream(st, input_ids, K)
+                    passing.append((wall, tier, timing))
+                    if len(passing) == 2 or K == 1 or tier == 1:
+                        break
+                    continue
                 reason = "non-finite logits" if not finite else f"margin {margin:.3f} > {MARGIN_LIMIT}"
             except Exception as exc:
                 reason = f"exception {repr(exc)[:200]}"
-            nxt = order[order.index(tier) + 1] if order.index(tier) + 1 < len(order) else 0
+            nxt = order[n + 1] if n + 1 < len(order) else 0
             log(f"FALLBACK T{tier}->T{nxt}: {reason}")
             self.state = None
-        self.tier = chosen
         check_s = time.perf_counter() - t_start
 
-        if chosen > 0:
-            st = self.state
-            timing = []
-            t0 = time.perf_counter()
-            for _ in self._stream(st, input_ids, K, timing):
-                pass
-            wall = (time.perf_counter() - t0) * 1e3
+        if passing:
+            wall, chosen, timing = min(passing)
+            if len(passing) > 1:
+                log("speed: " + " ".join(f"T{t}={w / K:.3f}ms/tok" for w, t, _ in passing) + f" -> T{chosen}")
+            if self.state is None or self.state.tier != chosen:
+                self._build(B, S, N, chosen)
             # free the native model's unpacked copies; our tiers never touch them again
             self.hf = None
             gc.collect()
@@ -423,13 +503,28 @@ class Engine:
                 torch.cuda.empty_cache()
             if timing:
                 dec = sorted(timing[1:]) or [0.0]
-                gpu = sum(timing)
-                host = (wall - gpu) / max(1, K)
+                host = (wall - sum(timing)) / max(1, K)
                 log(f"timing T{chosen} {B}x{S}: prefill={timing[0]:.2f}ms step mean={sum(dec) / len(dec):.3f} "
                     f"p50={dec[len(dec) // 2]:.3f} max={dec[-1]:.3f}ms host_overhead/step={host:.3f}ms "
                     f"stream_wall={wall:.1f}ms for {K} tok")
+        else:
+            chosen = 0
+        self.tier = chosen
         peak = torch.cuda.max_memory_reserved() / 1e9 if CUDA else 0.0
         log(f"tier=T{chosen} shape={B}x{S}x{N} check={check_s:.1f}s load={self.load_s:.1f}s peak={peak:.1f}GB")
+
+    def _time_stream(self, st, input_ids, K):
+        """Best-of-two wall time (ms) of a K-token stream, with per-step GPU timings."""
+        best = None
+        for _ in range(2):
+            timing = []
+            t0 = time.perf_counter()
+            for _ in self._stream(st, input_ids, K, timing):
+                pass
+            wall = (time.perf_counter() - t0) * 1e3
+            if best is None or wall < best[0]:
+                best = (wall, timing)
+        return best
 
     # ------------------------------------------------------------------ API
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
