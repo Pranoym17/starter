@@ -15,6 +15,10 @@ debug_barrier before it, L2 (.cg) loads after it) - no extra launch. RMSNorm sta
 sums of squares of the BF16 residual stream accumulated by the kernel that produces it (fp32
 atomics: order-dependent at the ulp level, like any reduction reorder). Every BF16 rounding point of
 transformers 4.51.3 is kept.
+
+Each kernel body is a `*_unit` device function over one work unit, shared with the persistent
+megakernel (kernels/mega.py); CG=True makes activation loads bypass L1 (data produced by other CTAs
+inside the same launch).
 """
 
 import math
@@ -36,10 +40,17 @@ def _bf(x):
     return x.to(tl.bfloat16).to(tl.float32)
 
 
+@triton.jit
+def _ld(ptrs, mask, other, CG: tl.constexpr):
+    if CG:
+        return tl.load(ptrs, mask=mask, other=other, cache_modifier=".cg")
+    else:
+        return tl.load(ptrs, mask=mask, other=other)
+
+
 # ------------------------------------------------------------------------------------ embedding
 @triton.jit
-def _embed_ss_kernel(tok_ptr, emb_ptr, x_ptr, ss_ptr, M, H, n_slots, BLOCK_H: tl.constexpr):
-    m = tl.program_id(0)
+def _embed_unit(m, tok_ptr, emb_ptr, x_ptr, ss_ptr, M, H, n_slots, BLOCK_H: tl.constexpr):
     t = tl.load(tok_ptr + m)
     acc = tl.zeros([BLOCK_H], tl.float32)
     for h0 in range(0, H, BLOCK_H):
@@ -54,6 +65,11 @@ def _embed_ss_kernel(tok_ptr, emb_ptr, x_ptr, ss_ptr, M, H, n_slots, BLOCK_H: tl
         tl.store(ss_ptr + s * M + m, 0.0)
 
 
+@triton.jit
+def _embed_ss_kernel(tok_ptr, emb_ptr, x_ptr, ss_ptr, M, H, n_slots, BLOCK_H: tl.constexpr):
+    _embed_unit(tl.program_id(0), tok_ptr, emb_ptr, x_ptr, ss_ptr, M, H, n_slots, BLOCK_H)
+
+
 def embed_ss(tok, emb, x, ss):
     """tok int64[M]; emb [V, H]; x [M, H] out; ss fp32 [n_slots, M] (slot 0 written, others zeroed)."""
     M, H = x.shape
@@ -63,11 +79,11 @@ def embed_ss(tok, emb, x, ss):
 # ------------------------------------------------------------------------------------ skinny GEMM
 @triton.jit
 def _epilogue(acc, acc2, rm, rn, m_ok, n_ok, out_ptr, res_ptr, ss_out_ptr, stride_out,
-              EPI: tl.constexpr, SS_OUT: tl.constexpr):
+              EPI: tl.constexpr, SS_OUT: tl.constexpr, CG: tl.constexpr):
     mask = m_ok[:, None] & n_ok[None, :]
     offs = rm[:, None] * stride_out + rn[None, :]
     if EPI == 1:
-        y = tl.load(res_ptr + offs, mask=mask, other=0.0).to(tl.float32) + _bf(acc)
+        y = _ld(res_ptr + offs, mask, 0.0, CG).to(tl.float32) + _bf(acc)
     elif EPI == 2:
         g = _bf(acc)
         y = _bf(tl.math.div_rn(g, 1.0 + libdevice.exp(-g))) * _bf(acc2)
@@ -81,19 +97,17 @@ def _epilogue(acc, acc2, rm, rn, m_ok, n_ok, out_ptr, res_ptr, ss_out_ptr, strid
 
 
 @triton.jit
-def _gemm_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, ticket_ptr, nw_ptr, ss_in_ptr, ss_out_ptr,
-                 eps, M, N, K, stride_x, stride_w, stride_out, k_chunk, n_split, pair_off,
-                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                 EPI: tl.constexpr, NORM: tl.constexpr, SS_OUT: tl.constexpr):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
+def _gemm_unit(pid_n, pid_k, x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, ticket_ptr, nw_ptr, ss_in_ptr, ss_out_ptr,
+               eps, M, N, K, stride_x, stride_w, stride_out, k_chunk, n_split, pair_off,
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+               EPI: tl.constexpr, NORM: tl.constexpr, SS_OUT: tl.constexpr, CG: tl.constexpr):
     rm = tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
     m_ok = rm < M
     n_ok = rn < N
     if NORM:  # Qwen3RMSNorm statistics were accumulated by the producer of x
-        rstd = tl.math.rsqrt(tl.load(ss_in_ptr + rm, mask=m_ok, other=0.0) / K + eps)
+        rstd = tl.math.rsqrt(_ld(ss_in_ptr + rm, m_ok, 0.0, CG) / K + eps)
     k_lo = pid_k * k_chunk
     k_hi = tl.minimum(k_lo + k_chunk, K)
     acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
@@ -102,7 +116,7 @@ def _gemm_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, ticket_ptr, nw_ptr, s
     w_base = w_ptr + rn[:, None] * stride_w
     for k0 in range(k_lo, k_hi, BLOCK_K):
         k = k0 + rk
-        x = tl.load(x_base + k[None, :], mask=m_ok[:, None], other=0.0)
+        x = _ld(x_base + k[None, :], m_ok[:, None], 0.0, CG)
         if NORM:  # weight * bf16(x * rstd), rounded to BF16 (the reference's cast placement)
             xn = (x.to(tl.float32) * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
             x = (xn * tl.load(nw_ptr + k).to(tl.float32)[None, :]).to(tl.bfloat16)
@@ -113,7 +127,7 @@ def _gemm_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, ticket_ptr, nw_ptr, s
                          eviction_policy="evict_first")
             acc2 = tl.dot(x, tl.trans(w2), acc2)
     if n_split == 1:
-        _epilogue(acc, acc2, rm, rn, m_ok, n_ok, out_ptr, res_ptr, ss_out_ptr, stride_out, EPI, SS_OUT)
+        _epilogue(acc, acc2, rm, rn, m_ok, n_ok, out_ptr, res_ptr, ss_out_ptr, stride_out, EPI, SS_OUT, CG)
     else:
         mask = m_ok[:, None] & n_ok[None, :]
         pp = part_ptr + (pid_k * M + rm[:, None]) * (2 * N) + rn[None, :]
@@ -130,12 +144,30 @@ def _gemm_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, ticket_ptr, nw_ptr, s
                 acc += tl.load(ps, mask=mask, other=0.0, cache_modifier=".cg")
                 if EPI == 2:
                     acc2 += tl.load(ps + N, mask=mask, other=0.0, cache_modifier=".cg")
-            _epilogue(acc, acc2, rm, rn, m_ok, n_ok, out_ptr, res_ptr, ss_out_ptr, stride_out, EPI, SS_OUT)
-            tl.atomic_xchg(ticket_ptr + pid_n, 0)             # ready for the next launch
+            _epilogue(acc, acc2, rm, rn, m_ok, n_ok, out_ptr, res_ptr, ss_out_ptr, stride_out, EPI, SS_OUT, CG)
+            tl.atomic_xchg(ticket_ptr + pid_n, 0)             # ready for the next use
+
+
+@triton.jit
+def _gemm_kernel(x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, ticket_ptr, nw_ptr, ss_in_ptr, ss_out_ptr,
+                 eps, M, N, K, stride_x, stride_w, stride_out, k_chunk, n_split, pair_off,
+                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                 EPI: tl.constexpr, NORM: tl.constexpr, SS_OUT: tl.constexpr):
+    _gemm_unit(tl.program_id(0), tl.program_id(1), x_ptr, w_ptr, out_ptr, res_ptr, part_ptr, ticket_ptr, nw_ptr,
+               ss_in_ptr, ss_out_ptr, eps, M, N, K, stride_x, stride_w, stride_out, k_chunk, n_split, pair_off,
+               BLOCK_M, BLOCK_N, BLOCK_K, EPI, NORM, SS_OUT, False)
 
 
 def _block_m(M):
     return max(16, triton.next_power_of_2(M))
+
+
+def split_plan(N, K, bn, bk, split):
+    """(k_chunk, n_split, tiles) for a requested split-K factor."""
+    steps = K // bk
+    split = max(1, min(split, steps))
+    chunk = triton.cdiv(steps, split) * bk
+    return chunk, triton.cdiv(K, chunk), triton.cdiv(N, bn)
 
 
 class FastGemm:
@@ -152,11 +184,8 @@ class FastGemm:
 
     def set_config(self, cfg):
         bn, bk, warps, stages, split = cfg
-        steps = self.K // bk
-        split = max(1, min(split, steps))
-        chunk = triton.cdiv(steps, split) * bk
-        self.split = triton.cdiv(self.K, chunk)
-        self.chunk, self.tiles, self.cfg = chunk, triton.cdiv(self.N, bn), (bn, bk, warps, stages, split)
+        self.chunk, self.split, self.tiles = split_plan(self.N, self.K, bn, bk, split)
+        self.cfg = (bn, bk, warps, stages, split)
         self.part = torch.empty((max(self.split, 1), self.M, 2 * self.N), dtype=torch.float32, device=self.device)
         self.ticket = torch.zeros((self.tiles,), dtype=torch.int32, device=self.device)
 
@@ -186,17 +215,14 @@ class FastGemm:
 
 # ------------------------------------------------------------------------------------ attention
 @triton.jit
-def _attn_fused_kernel(
-    qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr, k_ptr, v_ptr, acc_ptr, ml_ptr, ticket_ptr, out_ptr,
-    stride_qkv, stride_kb, stride_kh, stride_kn, n_kv_heads, n_splits, chunk, scale, eps,
-    GROUP: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr, QPAD: tl.constexpr, SPLITS_P2: tl.constexpr,
-):
-    """One program per (sequence b, KV head, split). q/k per-head RMSNorm + RoPE from the packed qkv
-    row, writes the new token's K/V into the cache (the split owning `pos`), flash-decodes its key
-    range (P rounded to BF16 before P@V, like flash), and the last split to finish merges."""
-    b = tl.program_id(0)
-    kvh = tl.program_id(1)
-    split = tl.program_id(2)
+def _attn_unit(b, kvh, split,
+               qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr, k_ptr, v_ptr, acc_ptr, ml_ptr, ticket_ptr, out_ptr,
+               stride_qkv, stride_kb, stride_kh, stride_kn, n_kv_heads, n_splits, chunk, scale, eps,
+               GROUP: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr, QPAD: tl.constexpr,
+               SPLITS_P2: tl.constexpr, CG: tl.constexpr):
+    """One (sequence b, KV head, split) unit. q/k per-head RMSNorm + RoPE from the packed qkv row,
+    writes the new token's K/V into the cache (the split owning `pos`), flash-decodes its key range
+    (P rounded to BF16 before P@V, like flash), and the last split to finish merges."""
     HALF: tl.constexpr = D // 2
     pos = tl.load(pos_ptr).to(tl.int32)
     rows = tl.arange(0, QPAD)
@@ -213,8 +239,8 @@ def _attn_fused_kernel(
 
     # q heads of this group: Qwen3RMSNorm(128) -> BF16, then RoPE with BF16 intermediates
     qp = row_base + qh[:, None] * D
-    x1 = tl.load(qp + d[None, :], mask=row_ok[:, None], other=0.0).to(tl.float32)
-    x2 = tl.load(qp + HALF + d[None, :], mask=row_ok[:, None], other=0.0).to(tl.float32)
+    x1 = _ld(qp + d[None, :], row_ok[:, None], 0.0, CG).to(tl.float32)
+    x2 = _ld(qp + HALF + d[None, :], row_ok[:, None], 0.0, CG).to(tl.float32)
     r = tl.math.rsqrt((tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / D + eps)
     w1 = tl.load(qn_ptr + d).to(tl.float32)
     w2 = tl.load(qn_ptr + HALF + d).to(tl.float32)
@@ -250,8 +276,8 @@ def _attn_fused_kernel(
     if owns:
         # the new token: k = RoPE(RMSNorm(k)), v as is; store for later steps, attend from registers
         kp_new = row_base + (n_q_heads + kvh) * D
-        kx1 = tl.load(kp_new + d).to(tl.float32)
-        kx2 = tl.load(kp_new + HALF + d).to(tl.float32)
+        kx1 = _ld(kp_new + d, d < HALF, 0.0, CG).to(tl.float32)
+        kx2 = _ld(kp_new + HALF + d, d < HALF, 0.0, CG).to(tl.float32)
         kr = tl.math.rsqrt((tl.sum(kx1 * kx1, axis=0) + tl.sum(kx2 * kx2, axis=0)) / D + eps)
         kw1 = tl.load(kn_ptr + d).to(tl.float32)
         kw2 = tl.load(kn_ptr + HALF + d).to(tl.float32)
@@ -260,7 +286,7 @@ def _attn_fused_kernel(
         kn1 = _bf(_bf(ky1 * c1) + _bf(-ky2 * s1))
         kn2 = _bf(_bf(ky2 * c2) + _bf(ky1 * s2))
         vp_new = row_base + (n_q_heads + n_kv_heads + kvh) * D
-        vn = tl.load(vp_new + dd)
+        vn = _ld(vp_new + dd, dd < D, 0.0, CG)
         dst = base + pos * stride_kn
         tl.store(k_ptr + dst + d, kn1.to(tl.bfloat16))
         tl.store(k_ptr + dst + HALF + d, kn2.to(tl.bfloat16))
@@ -304,18 +330,32 @@ def _attn_fused_kernel(
         tl.atomic_xchg(tk, 0)
 
 
+@triton.jit
+def _attn_fused_kernel(
+    qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr, k_ptr, v_ptr, acc_ptr, ml_ptr, ticket_ptr, out_ptr,
+    stride_qkv, stride_kb, stride_kh, stride_kn, n_kv_heads, n_splits, chunk, scale, eps,
+    GROUP: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr, QPAD: tl.constexpr, SPLITS_P2: tl.constexpr,
+):
+    _attn_unit(tl.program_id(0), tl.program_id(1), tl.program_id(2),
+               qkv_ptr, qn_ptr, kn_ptr, cos_ptr, sin_ptr, pos_ptr, k_ptr, v_ptr, acc_ptr, ml_ptr, ticket_ptr, out_ptr,
+               stride_qkv, stride_kb, stride_kh, stride_kn, n_kv_heads, n_splits, chunk, scale, eps,
+               GROUP, D, BLOCK_N, QPAD, SPLITS_P2, False)
+
+
+def attn_split_plan(batch, n_kv_heads, capacity, sm_count, block_n=64, splits=None):
+    if splits is None:
+        splits = max(1, min(-(-2 * sm_count // (batch * n_kv_heads)), -(-capacity // block_n)))
+    chunk = -(-capacity // splits)
+    chunk = -(-chunk // block_n) * block_n
+    return chunk, -(-capacity // chunk)
+
+
 class FastAttention:
-    """Fused decode attention for a fixed (batch, capacity); see _attn_fused_kernel."""
+    """Fused decode attention for a fixed (batch, capacity); see _attn_unit."""
 
     def __init__(self, batch, n_kv_heads, capacity, device, sm_count, block_n=64, splits=None):
         self.batch, self.n_kv, self.capacity, self.block_n = batch, n_kv_heads, capacity, block_n
-        target = 2 * sm_count
-        if splits is None:
-            splits = max(1, min(-(-target // (batch * n_kv_heads)), -(-capacity // block_n)))
-        chunk = -(-capacity // splits)
-        chunk = -(-chunk // block_n) * block_n
-        self.splits = -(-capacity // chunk)
-        self.chunk = chunk
+        self.chunk, self.splits = attn_split_plan(batch, n_kv_heads, capacity, sm_count, block_n, splits)
         nq = n_kv_heads * 4
         self.acc = torch.empty((batch * nq * self.splits, 128), dtype=torch.float32, device=device)
         self.ml = torch.empty((batch * nq * self.splits, 2), dtype=torch.float32, device=device)
@@ -338,22 +378,22 @@ class FastAttention:
 
 # ------------------------------------------------------------------------------------ LM head
 @triton.jit
-def _lm_kernel(x_ptr, w_ptr, pval_ptr, pidx_ptr, ticket_ptr, tok_ptr, pos_ptr, nw_ptr, ss_in_ptr, eps,
-               M, N, K, stride_x, stride_w, n_tiles,
-               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_T: tl.constexpr,
-               INC_POS: tl.constexpr):
-    pid = tl.program_id(0)
+def _lm_unit(pid, x_ptr, w_ptr, pval_ptr, pidx_ptr, ticket_ptr, tok_ptr, pos_ptr, nw_ptr, ss_in_ptr, eps,
+             M, N, K, stride_x, stride_w, n_tiles,
+             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_T: tl.constexpr,
+             INC_POS: tl.constexpr, CG: tl.constexpr):
+    """One vocabulary tile; returns True in the CTA that finished the global argmax."""
     rm = tl.arange(0, BLOCK_M)
     rn = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
     m_ok = rm < M
     n_ok = rn < N
-    rstd = tl.math.rsqrt(tl.load(ss_in_ptr + rm, mask=m_ok, other=0.0) / K + eps)
+    rstd = tl.math.rsqrt(_ld(ss_in_ptr + rm, m_ok, 0.0, CG) / K + eps)
     acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
     x_base = x_ptr + rm[:, None] * stride_x
     for k0 in range(0, K, BLOCK_K):
         k = k0 + rk
-        x = tl.load(x_base + k[None, :], mask=m_ok[:, None], other=0.0)
+        x = _ld(x_base + k[None, :], m_ok[:, None], 0.0, CG)
         xn = (x.to(tl.float32) * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
         x = (xn * tl.load(nw_ptr + k).to(tl.float32)[None, :]).to(tl.bfloat16)
         w = tl.load(w_ptr + rn[:, None] * stride_w + k[None, :], mask=n_ok[:, None], other=0.0,
@@ -366,7 +406,8 @@ def _lm_kernel(x_ptr, w_ptr, pval_ptr, pidx_ptr, ticket_ptr, tok_ptr, pos_ptr, n
     tl.store(pidx_ptr + rm * n_tiles + pid, idx, mask=m_ok)
     tl.debug_barrier()
     ticket = tl.atomic_add(ticket_ptr, 1, sem="acq_rel")
-    if ticket == n_tiles - 1:                                   # last tile: global argmax per row
+    last = ticket == n_tiles - 1
+    if last:                                                    # last tile: global argmax per row
         for m in range(0, M):
             bv = tl.full([BLOCK_T], float("-inf"), tl.float32)
             bi = tl.full([BLOCK_T], 2147483647, tl.int32)
@@ -383,6 +424,16 @@ def _lm_kernel(x_ptr, w_ptr, pval_ptr, pidx_ptr, ticket_ptr, tok_ptr, pos_ptr, n
         if INC_POS:
             tl.store(pos_ptr, tl.load(pos_ptr) + 1)
         tl.atomic_xchg(ticket_ptr, 0)
+    return last
+
+
+@triton.jit
+def _lm_kernel(x_ptr, w_ptr, pval_ptr, pidx_ptr, ticket_ptr, tok_ptr, pos_ptr, nw_ptr, ss_in_ptr, eps,
+               M, N, K, stride_x, stride_w, n_tiles,
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_T: tl.constexpr,
+               INC_POS: tl.constexpr):
+    _lm_unit(tl.program_id(0), x_ptr, w_ptr, pval_ptr, pidx_ptr, ticket_ptr, tok_ptr, pos_ptr, nw_ptr, ss_in_ptr,
+             eps, M, N, K, stride_x, stride_w, n_tiles, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_T, INC_POS, False)
 
 
 class FastLmHead:

@@ -10,6 +10,8 @@ Tiers, fastest first. On the first call of a shape (the platform's untimed warmu
 validates tiers against the loaded native model by teacher-forcing their own tokens, falling
 back a tier on any exception, non-finite logit, or margin above MARGIN_LIMIT, and keeps the
 faster of the two best passing tiers:
+  T6  one persistent kernel per decode step (all layers + LM head), T5's arithmetic, counter-based
+      dependencies between ops, bounded spins
   T5  five kernels per layer: norm statistics carried in epilogues, split-K reduced by the last CTA
       (no reduce launches), attention with fused q/k-norm + RoPE + KV write + merge, LM head +
       argmax + position advance in one launch
@@ -53,6 +55,11 @@ try:
     _FAST_ERR = None
 except Exception as _exc:
     _FAST_ERR = repr(_exc)[:200]
+try:
+    from kernels.mega import MegaStep
+    _MEGA_ERR = None
+except Exception as _exc:
+    _MEGA_ERR = repr(_exc)[:200]
 
 DEVICE = os.environ.get("ENGINE_DEVICE", "cuda:0")
 CUDA = DEVICE.startswith("cuda")
@@ -73,10 +80,11 @@ WARMUP_SOFT_S = 170.0     # past this many seconds since load start, skip option
 
 GEMV_MAX_B = 64          # T4's skinny-GEMM decode path covers batches up to this
 
-#            graphs  triton  fused  gemv   fast
-TIERS = {5: (True, True, True, False, True), 4: (True, True, True, True, False),
-         3: (True, True, True, False, False), 2: (True, True, False, False, False),
-         1: (False, False, False, False, False)}
+#            graphs  triton  fused  gemv   fast   mega
+TIERS = {6: (True, True, True, False, False, True), 5: (True, True, True, False, True, False),
+         4: (True, True, True, True, False, False), 3: (True, True, True, False, False, False),
+         2: (True, True, False, False, False, False), 1: (False, False, False, False, False, False)}
+COMPARE_TIERS = 3         # time up to this many passing tiers at warmup and keep the fastest
 
 
 def log(msg):
@@ -139,7 +147,7 @@ class _State:
 
     def __init__(self, eng, B, S, N, tier):
         self.B, self.S, self.N, self.tier = B, S, N, tier
-        self.graphs, self.triton, self.fused, self.gemv, self.fast = TIERS[tier]
+        self.graphs, self.triton, self.fused, self.gemv, self.fast, self.mega = TIERS[tier]
         # speculative verify width T = k + 1 (0 = off); B*T rows must fit the skinny GEMMs
         T = 7 if B == 1 else 5
         self.spec_T = T if (self.gemv and SPEC and N > 1 and B * T <= SPEC_MAX_ROWS
@@ -147,8 +155,11 @@ class _State:
         self.spec = False
         cap = self.capacity = S + N + self.spec_T
         n_layers = len(eng.layers)
-        self.k_cache = [torch.zeros((B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE) for _ in range(n_layers)]
-        self.v_cache = [torch.zeros((B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE) for _ in range(n_layers)]
+        # one stacked cache per K/V (layer-major) so the persistent kernel can index layers
+        self.k_all = torch.zeros((n_layers, B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE)
+        self.v_all = torch.zeros((n_layers, B, N_KV, cap, HEAD_DIM), dtype=BF16, device=DEVICE)
+        self.k_cache = [self.k_all[i] for i in range(n_layers)]
+        self.v_cache = [self.v_all[i] for i in range(n_layers)]
         with torch.inference_mode():
             dummy = torch.empty(1, dtype=BF16, device=DEVICE)
             cos, sin = eng.rotary(dummy, torch.arange(cap, device=DEVICE)[None])  # reference module
@@ -171,6 +182,13 @@ class _State:
             self.plans, self.qkv_buf, self.act_buf = eng._make_plans(B)
         if self.fast:
             eng._fast_plans(self)
+        if self.mega:
+            H, I = eng.embed.shape[1], eng.inter
+            self.x = torch.empty((B, H), dtype=BF16, device=DEVICE)
+            self.ss = torch.zeros((2 * n_layers + 1, B), dtype=torch.float32, device=DEVICE)
+            self.qkv_buf = torch.empty((B, eng.w_qkv_all.shape[1]), dtype=BF16, device=DEVICE)
+            self.act_buf = torch.empty((B, I), dtype=BF16, device=DEVICE)
+            self.megastep = MegaStep(eng, self)
         if self.spec_T:
             T = self.spec_T
             self.vplans, self.v_qkv, self.v_act = eng._make_plans(B * T)
@@ -206,16 +224,36 @@ class Engine:
         self.rotary = base.rotary_emb
         self.layers = []
         with torch.no_grad():
-            for layer in base.layers:
+            # layer-stacked, packed weights; every tier uses views into them (the persistent kernel
+            # addresses layer l at a fixed stride). The native model keeps its own copies until the
+            # warmup self-check is done.
+            NL, H = len(base.layers), cfg.hidden_size
+            a0, m0 = base.layers[0].self_attn, base.layers[0].mlp
+            nq, nkv, I = a0.q_proj.weight.shape[0], a0.k_proj.weight.shape[0], cfg.intermediate_size
+            new = lambda *shape: torch.empty(shape, dtype=BF16, device=DEVICE)  # noqa: E731
+            self.w_qkv_all = new(NL, nq + 2 * nkv, H)
+            self.w_o_all = new(NL, H, a0.o_proj.weight.shape[1])
+            self.w_gu_all = new(NL, 2 * I, H)
+            self.w_d_all = new(NL, H, I)
+            self.ln1_all, self.ln2_all = new(NL, H), new(NL, H)
+            self.qn_all, self.kn_all = new(NL, HEAD_DIM), new(NL, HEAD_DIM)
+            for i, layer in enumerate(base.layers):
                 at, mlp = layer.self_attn, layer.mlp
+                self.w_qkv_all[i, :nq].copy_(at.q_proj.weight)
+                self.w_qkv_all[i, nq:nq + nkv].copy_(at.k_proj.weight)
+                self.w_qkv_all[i, nq + nkv:].copy_(at.v_proj.weight)
+                self.w_o_all[i].copy_(at.o_proj.weight)
+                self.w_gu_all[i, :I].copy_(mlp.gate_proj.weight)
+                self.w_gu_all[i, I:].copy_(mlp.up_proj.weight)
+                self.w_d_all[i].copy_(mlp.down_proj.weight)
+                self.ln1_all[i].copy_(layer.input_layernorm.weight)
+                self.ln2_all[i].copy_(layer.post_attention_layernorm.weight)
+                self.qn_all[i].copy_(at.q_norm.weight)
+                self.kn_all[i].copy_(at.k_norm.weight)
                 L = _Layer()
-                L.ln1 = layer.input_layernorm.weight
-                L.ln2 = layer.post_attention_layernorm.weight
-                L.q_norm, L.k_norm = at.q_norm.weight, at.k_norm.weight
-                L.w_qkv = torch.cat([at.q_proj.weight, at.k_proj.weight, at.v_proj.weight], 0).contiguous()
-                L.w_o = at.o_proj.weight
-                L.w_gu = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], 0).contiguous()
-                L.w_down = mlp.down_proj.weight
+                L.ln1, L.ln2 = self.ln1_all[i], self.ln2_all[i]
+                L.q_norm, L.k_norm = self.qn_all[i], self.kn_all[i]
+                L.w_qkv, L.w_o, L.w_gu, L.w_down = self.w_qkv_all[i], self.w_o_all[i], self.w_gu_all[i], self.w_d_all[i]
                 self.layers.append(L)
         self.sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count if CUDA else 1
         self.state = None
@@ -226,7 +264,8 @@ class Engine:
         self.load_s = time.perf_counter() - t0
         log(f"loaded in {self.load_s:.1f}s; kernels {'ok' if _KERNEL_ERR is None else 'UNAVAILABLE ' + _KERNEL_ERR}; "
             f"fused {'ok' if _FUSED_ERR is None else 'UNAVAILABLE ' + _FUSED_ERR}; "
-            f"T5 {'ok' if _FAST_ERR is None else 'UNAVAILABLE ' + _FAST_ERR}; gqa_flash={self.gqa_flash}")
+            f"T5 {'ok' if _FAST_ERR is None else 'UNAVAILABLE ' + _FAST_ERR}; "
+            f"T6 {'ok' if _MEGA_ERR is None else 'UNAVAILABLE ' + _MEGA_ERR}; gqa_flash={self.gqa_flash}")
 
     def _make_plans(self, M):
         """T4 skinny-GEMM plans for M rows (tuned once per M; tuning compiles every kept config)."""
@@ -476,6 +515,8 @@ class Engine:
 
     def _decode(self, st, host_pos=None):
         """One token per sequence at st.pos (device) or host_pos (eager T1); advances st.pos."""
+        if st.mega:
+            return st.megastep()
         if st.fast:
             return self._decode_fast(st)
         if st.gemv:
@@ -525,7 +566,7 @@ class Engine:
 
     # ------------------------------------------------------------------ shapes, graphs
     def _build(self, B, S, N, tier):
-        if tier in (4, 5) and B > GEMV_MAX_B:
+        if tier in (4, 5, 6) and B > GEMV_MAX_B:
             tier = 3
         self.state = None
         gc.collect()
@@ -763,7 +804,8 @@ class Engine:
             order = [FORCE_TIER] if FORCE_TIER > 0 else []
         elif _KERNEL_ERR is None and CUDA:
             small = B <= GEMV_MAX_B and _FUSED_ERR is None
-            order = ([5] if small and _FAST_ERR is None else []) \
+            order = ([6] if small and _FAST_ERR is None and _MEGA_ERR is None else []) \
+                + ([5] if small and _FAST_ERR is None else []) \
                 + ([4] if small and _GEMV_ERR is None else []) \
                 + ([3] if _FUSED_ERR is None else []) + [2, 1]
         else:
@@ -782,10 +824,18 @@ class Engine:
                 log(f"check T{tier}: margin={margin:.3f} non_argmax={nonarg}/{B * K} first_non_argmax={first_nonarg} "
                     f"first_diverge_vs_native={div} prefill_logit_maxdiff={dlog:.3f} finite={finite} "
                     f"compile={st.compile_s:.1f}s capture={st.capture_s:.1f}s")
+                if st.mega and CUDA and int(st.megastep.err.item()) != 0:
+                    finite = False                             # a bounded spin expired: not trustworthy
+                    log(f"T6 spin limit hit ({st.megastep.describe()})")
                 if finite and margin <= MARGIN_LIMIT:
                     wall, timing = self._time_stream(st, input_ids, K)
+                    if st.mega and CUDA and int(st.megastep.err.item()) != 0:
+                        log("T6 spin limit hit while timing; dropped")
+                        continue
                     passing.append((wall, tier, timing))
-                    if len(passing) == 2 or K == 1 or tier == 1:
+                    budget_ok = time.perf_counter() - self.t_load0 < WARMUP_SOFT_S - 40
+                    if len(passing) >= COMPARE_TIERS or (len(passing) >= 2 and not budget_ok) \
+                            or K == 1 or tier == 1:
                         break
                     continue
                 reason = "non-finite logits" if not finite else f"margin {margin:.3f} > {MARGIN_LIMIT}"

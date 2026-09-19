@@ -70,7 +70,7 @@ class FakeDriver:
 
 _driver.set_active(FakeDriver())
 
-from kernels import decode_attn, fast, fused, gemv, rmsnorm  # noqa: E402
+from kernels import decode_attn, fast, fused, gemv, mega, rmsnorm  # noqa: E402
 
 BF16 = torch.bfloat16
 
@@ -148,6 +148,23 @@ def cases(quick):
                 lm(t(B, H), t(V, H), t(B, dtype=torch.int64), t(H), t(B, dtype=torch.float32),
                    t(1, dtype=torch.int64), True)
             yield f"fast lm B={B} cfg={cfg}", run_flm
+        # T6 persistent megakernel (only constexprs matter for compilation: small NL / V are fine)
+        def run_mega(B=B, cap=cap):
+            from types import SimpleNamespace
+            from kernels import mega
+            NL, Vs = 1, 1024
+            eng = SimpleNamespace(embed=t(Vs, H), inter=I, lm_head=t(Vs, H), w_qkv_all=t(NL, 6144, H),
+                                  w_o_all=t(NL, H, 4096), w_gu_all=t(NL, 2 * I, H), w_d_all=t(NL, H, I),
+                                  ln1_all=t(NL, H), ln2_all=t(NL, H), qn_all=t(NL, D), kn_all=t(NL, D),
+                                  final_norm=t(H), layers=[None] * NL, eps=1e-6, sm_count=132)
+            st = SimpleNamespace(B=B, capacity=cap, k_all=t(NL, B, NKV, cap, D), v_all=t(NL, B, NKV, cap, D),
+                                 tok=t(B, dtype=torch.int64), pos=t(1, dtype=torch.int64), x=t(B, H),
+                                 ss=t(2 * NL + 1, B, dtype=torch.float32), qkv_buf=t(B, 6144),
+                                 attn_out=t(B, NQ, D), act_buf=t(B, I), cos=t(cap, D), sin=t(cap, D))
+            m = mega.MegaStep(eng, st)
+            m()
+            print(f"    mega B={B}: {m.describe()}")
+        yield f"mega B={B}", run_mega
         for T in (5, 7):
             if B * T > 64:
                 continue
@@ -202,7 +219,7 @@ def main():
                 decode_attn._attn_verify_partial_kernel, fused._qk_norm_rope_kernel, fused._silu_mul_kernel,
                 gemv._gemv_kernel, gemv._splitk_reduce_kernel, gemv._lm_argmax_partial_kernel,
                 gemv._lm_argmax_reduce_kernel, rmsnorm._rms_norm_rows_kernel, fast._gemm_kernel,
-                fast._attn_fused_kernel, fast._lm_kernel, fast._embed_ss_kernel]
+                fast._attn_fused_kernel, fast._lm_kernel, fast._embed_ss_kernel, mega._mega_kernel]
         rows = ptxas_report(jits)
         worst = sorted(rows, key=lambda r: (-r[2], -r[1]))[:25]
         print(f"{'kernel':<34}{'regs':>6}{'spill B':>9}{'smem':>8}{'warps':>6}")

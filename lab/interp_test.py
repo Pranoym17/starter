@@ -27,7 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import interp_shims  # noqa: E402
 
 from kernels import fast as _fastk  # noqa: E402
-interp_shims.patch_libdevice(fused, gemv, _fastk)
+from kernels import mega as _megak  # noqa: E402
+interp_shims.patch_libdevice(fused, gemv, _fastk, _megak)
 
 BF16 = torch.bfloat16
 EPS = 1e-6
@@ -376,7 +377,7 @@ def test_end_to_end_t4_and_spec():
             for M in {B, B * 5, B * 7}:
                 eng._tuned[M] = {"qkv": (32, 128, 4, 4), "o": (32, 128, 4, 4), "gu": (32, 128, 4, 4),
                                  "down": (16, 256, 4, 3), "lm": (64, 128, 4, 4)}
-            for tier in (5, 4, 3, 2):
+            for tier in (6, 5, 4, 3, 2):
                 st = mod._State(eng, B, S, N, tier)
                 st.prefill_graph = SimpleNamespace(replay=lambda st=st: eng._prefill(st))
                 steps = []
